@@ -125,13 +125,15 @@ export async function getExpenses(month?: string): Promise<SheetRow[]> {
 }
 
 /**
- * Submit a new expense/income via the API route. Timestamp is added by the script.
+ * Submit a new expense/income via the API route. If `date` (YYYY-MM-DD) is provided,
+ * the Apps Script uses it as the Timestamp; otherwise it defaults to new Date().
  * Month is not sent; the sheet formula derives it from the timestamp.
  */
 export async function submitExpense(payload: {
   expenseType: string;
   amount: number;
   description: string;
+  date?: string;
 }): Promise<void> {
   const res = await fetch(SHEETS_API, {
     method: "POST",
@@ -141,6 +143,23 @@ export async function submitExpense(payload: {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || `Failed to submit: ${res.status}`);
+  }
+}
+
+/** Update the Timestamp on an existing sheet row (expense or transfer) by its row ID. */
+export async function updateSheetEntryDate(payload: {
+  sheet: "Expenses" | "Transfers";
+  rowId: string;
+  date: string;
+}): Promise<void> {
+  const res = await fetch(SHEETS_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "update", ...payload }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || `Failed to update: ${res.status}`);
   }
 }
 

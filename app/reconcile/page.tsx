@@ -3,13 +3,14 @@
 import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { useDropzone } from "react-dropzone";
 import Papa from "papaparse";
-import { Ban, Check, Filter, Link2Off, Loader2, PlusCircle, Search, Upload, X } from "lucide-react";
+import { Ban, Check, Filter, Link2Off, Loader2, Pencil, PlusCircle, Search, Upload, X } from "lucide-react";
 import DashboardLayout from "@/components/DashboardLayout";
 import GlassDropdown, { type GlassDropdownOption } from "@/components/GlassDropdown";
 import {
   getExpenses,
   getTransfers,
   submitExpense,
+  updateSheetEntryDate,
   type SheetRow,
   type TransferRow,
 } from "@/services/sheetsApi";
@@ -115,6 +116,15 @@ type AnchorModalState = {
   error: string;
 };
 
+type EditEntryModalState = {
+  open: boolean;
+  entry: UserInputtedEntry | null;
+  rowId: string;
+  date: string;
+  submitting: boolean;
+  error: string;
+};
+
 type DismissModalState = {
   open: boolean;
   match: MatchResult | null;
@@ -179,6 +189,12 @@ const RECONCILE_STORAGE_KEY = "reconcile-page-state-v3";
 
 function claimKey(sheetName: string, rowId: string): string {
   return `${sheetName}:${rowId}`;
+}
+
+/** Extracts the raw sheet row ID from an entry id like `"Expenses:uuid"` → `"uuid"`. */
+function rowIdFromEntryId(entryId: string): string {
+  const parsed = parseSheetDismissKeyFromEntryId(entryId);
+  return parsed?.sheetRowId ?? "";
 }
 
 /** For dismiss/claim APIs: real sheet row only (not `Expenses:missing:0`). */
@@ -705,6 +721,14 @@ export default function ReconcilePage() {
     open: false,
     entry: null,
     note: "",
+    submitting: false,
+    error: "",
+  });
+  const [editEntryModal, setEditEntryModal] = useState<EditEntryModalState>({
+    open: false,
+    entry: null,
+    rowId: "",
+    date: "",
     submitting: false,
     error: "",
   });
@@ -1598,17 +1622,21 @@ export default function ReconcilePage() {
     userDismissedRowKeys,
   ]);
 
-  /** Unprocessed bank lines across accounts — includes exact_match etc., not only manual-review rows. */
+  /** Unprocessed bank lines across accounts — includes exact_match etc., not only manual-review rows.
+   *  Also includes "processed without claim" rows (hash in processedHashes but no claim link) because
+   *  those show in the review queue and should be selectable for re-linking. */
   const allUnprocessedStatementMatchesForClaim = useMemo(() => {
     const list: MatchResult[] = [];
     for (const account of tabAccounts) {
       for (const m of statementRowsByAccount[account] ?? []) {
-        if (processedHashes.has(m.bankTransaction.hash)) continue;
+        if (processedHashes.has(m.bankTransaction.hash)) {
+          if (!isProcessedWithoutNeonClaim(m, processedHashes, dismissalNotesById, bankHashesWithNeonClaim)) continue;
+        }
         list.push(m);
       }
     }
     return sortByNewestDate(list, (match) => match.bankTransaction.date);
-  }, [processedHashes, statementRowsByAccount, tabAccounts]);
+  }, [bankHashesWithNeonClaim, dismissalNotesById, processedHashes, statementRowsByAccount, tabAccounts]);
 
   const userInputtedReviewRows = useMemo(
     () => userInputtedEntries.filter((e) => !e.isCompleted),
@@ -3124,6 +3152,52 @@ export default function ReconcilePage() {
     }
   }, [userDismissModal.entry, userDismissModal.note]);
 
+  const openEditEntryModal = useCallback((entry: UserInputtedEntry) => {
+    const rowId = rowIdFromEntryId(entry.id);
+    const raw = entry.dateValue;
+    const asDate = raw ? new Date(raw) : null;
+    const dateStr = asDate && !isNaN(asDate.getTime()) ? asDate.toISOString().slice(0, 10) : "";
+    setEditEntryModal({ open: true, entry, rowId, date: dateStr, submitting: false, error: "" });
+  }, []);
+
+  const closeEditEntryModal = useCallback(() => {
+    setEditEntryModal((prev) => ({ ...prev, open: false, entry: null, error: "" }));
+  }, []);
+
+  const handleEditEntrySubmit = useCallback(async () => {
+    const { entry, rowId, date } = editEntryModal;
+    if (!entry || !rowId) return;
+    if (!date) {
+      setEditEntryModal((prev) => ({ ...prev, error: "Select a date." }));
+      return;
+    }
+    setEditEntryModal((prev) => ({ ...prev, submitting: true, error: "" }));
+    try {
+      await updateSheetEntryDate({ sheet: entry.source, rowId, date });
+      if (entry.source === "Expenses") {
+        setSheetExpenses((prev) =>
+          prev.map((row) =>
+            (row.rowId ?? "").trim() === rowId ? { ...row, timestamp: date, date } : row,
+          ),
+        );
+      } else {
+        setSheetTransfers((prev) =>
+          prev.map((row) =>
+            (row.transferRowId ?? "").trim() === rowId ? { ...row, timestamp: date, date } : row,
+          ),
+        );
+      }
+      closeEditEntryModal();
+      rematchAllStoredAccounts();
+    } catch (err) {
+      setEditEntryModal((prev) => ({
+        ...prev,
+        submitting: false,
+        error: err instanceof Error ? err.message : "Failed to update date.",
+      }));
+    }
+  }, [closeEditEntryModal, editEntryModal, rematchAllStoredAccounts, setSheetExpenses, setSheetTransfers]);
+
   const openResetReconcileModal = useCallback(() => {
     setResetReconcileModal({ open: true, confirmText: "", submitting: false, error: "" });
   }, []);
@@ -3203,6 +3277,7 @@ export default function ReconcilePage() {
         expenseType,
         amount: amountNum,
         description,
+        date: tx.date,
       });
 
       // Find the newly-created sheet row so we can create a claim link.
@@ -4220,6 +4295,16 @@ export default function ReconcilePage() {
                                 title="Dismiss user-inputted row with note"
                               >
                                 <X className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => openEditEntryModal(entry)}
+                                disabled={!rowIdFromEntryId(entry.id)}
+                                className="p-1.5 rounded-md text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-60 transition-colors"
+                                aria-label="Edit date"
+                                title="Edit transaction date"
+                              >
+                                <Pencil className="w-4 h-4" />
                               </button>
                               <button
                                 type="button"
@@ -5976,6 +6061,70 @@ export default function ReconcilePage() {
               >
                 {anchorModal.saving && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                 Save Anchor
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editEntryModal.open && editEntryModal.entry && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"
+          onClick={closeEditEntryModal}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="edit-entry-date-title"
+        >
+          <div
+            className="w-full max-w-sm rounded-xl bg-[#252525] border border-charcoal-dark overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark flex items-center justify-between">
+              <h2 id="edit-entry-date-title" className="text-white font-semibold">Edit Transaction Date</h2>
+              <button
+                type="button"
+                onClick={closeEditEntryModal}
+                className="p-1 rounded-md text-gray-400 hover:text-white hover:bg-charcoal transition-colors"
+                aria-label="Close modal"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="px-4 py-3 space-y-3">
+              <div className="rounded-lg bg-charcoal px-3 py-2 text-sm">
+                <p className={editEntryModal.entry.source === "Expenses" ? "text-yellow-300 truncate" : "text-green-300 truncate"}>
+                  {editEntryModal.entry.title}
+                </p>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {editEntryModal.entry.subtitle} • {fmtMoney(editEntryModal.entry.amount)}
+                </p>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Date</label>
+                <input
+                  type="date"
+                  value={editEntryModal.date}
+                  onChange={(e) => setEditEntryModal((prev) => ({ ...prev, date: e.target.value }))}
+                  className="w-full px-3 py-2 rounded-lg bg-charcoal border border-charcoal-dark text-gray-200 text-sm focus:border-accent focus:ring-1 focus:ring-accent outline-none"
+                />
+              </div>
+              {editEntryModal.error && <p className="text-xs text-red-400">{editEntryModal.error}</p>}
+            </div>
+            <div className="px-4 py-3 border-t border-charcoal-dark flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeEditEntryModal}
+                className="px-3 py-1.5 rounded-lg text-sm text-gray-400 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleEditEntrySubmit()}
+                disabled={editEntryModal.submitting}
+                className="px-3 py-1.5 rounded-lg text-sm bg-accent text-white hover:bg-accent-dark transition-colors disabled:opacity-60 inline-flex items-center gap-1.5"
+              >
+                {editEntryModal.submitting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                Save
               </button>
             </div>
           </div>
