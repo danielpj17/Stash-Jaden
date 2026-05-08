@@ -398,8 +398,8 @@ function cleanBankDescription(rawDescription: string): string {
     .replace(/\s+card\s+\d{2,6}\b/gi, "")
     .replace(/\s+atm\s+id\s+\d+\b/gi, "")
     .replace(/\s+x{3,}\d{2,}\b/gi, "")
-    .replace(/\s+[a-z]\d{8,}\b/gi, "")
-    .replace(/\s+\d{10,}\b/g, "")
+    .replace(/\s+[a-z](\d{8,})\b/gi, (_, digits) => ` #${digits.slice(-4)}`)
+    .replace(/\s+(\d{10,})\b/g, (_, digits) => ` #${digits.slice(-4)}`)
     .replace(/\s+/g, " ")
     .trim();
   return cleaned || rawDescription.trim();
