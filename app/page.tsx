@@ -720,9 +720,9 @@ export default function BudgetPage() {
                 )}
 
                 <div className="flex items-center gap-2 px-2 pb-2 text-gray-500 text-[11px] font-medium uppercase tracking-wide border-b border-charcoal-dark">
-                  <span className="w-[88px] shrink-0">Category</span>
+                  <span className="w-[88px] min-w-0 truncate">Category</span>
                   <span className="w-[68px] shrink-0 text-right">Spent</span>
-                  <span className="flex-1 min-w-[60px]" />
+                  <span className="flex-1 min-w-0" />
                   <span className="w-[72px] shrink-0 text-right">Budgeted</span>
                 </div>
 
@@ -749,11 +749,11 @@ export default function BudgetPage() {
                           index % 2 === 0 ? "bg-[#2C2C2C]" : "bg-[#252525]"
                         }`}
                       >
-                        <span className="w-[88px] shrink-0 text-gray-300 truncate">{row.category}</span>
+                        <span className="w-[88px] min-w-0 text-gray-300 truncate">{row.category}</span>
                         <span className="w-[68px] shrink-0 text-right text-gray-200 tabular-nums text-xs">
                           {fmtDollars(row.total)}
                         </span>
-                        <span className="flex-1 min-w-[60px] mx-1" />
+                        <span className="flex-1 min-w-0 mx-1" />
                         <span className="w-[72px] shrink-0 text-right text-gray-400 tabular-nums text-xs">
                           {fmtDollars(budget)}
                         </span>
