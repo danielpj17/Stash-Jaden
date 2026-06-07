@@ -619,6 +619,7 @@ async function saveCsvRowsToNeon(accountName: string, rows: string[][]): Promise
 export default function ReconcilePage() {
   const [selectedAccount, setSelectedAccount] = useState<AccountOption>("WF Checking");
   const [isUploading, setIsUploading] = useState(false);
+  const [removingDuplicates, setRemovingDuplicates] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const matchedSectionRef = useRef<HTMLElement | null>(null);
   const [matchesByAccount, setMatchesByAccount] = useState<Record<string, MatchResult[]>>({});
@@ -3029,6 +3030,65 @@ export default function ReconcilePage() {
     [],
   );
 
+  const handleRemoveDuplicateRows = useCallback(
+    async (accountName: string) => {
+      if (typeof window !== "undefined") {
+        const ok = window.confirm(
+          `Remove already-reconciled duplicate statement rows for "${accountName}"?\n\nThis deletes redundant copies of transactions that are already matched or processed — the leftovers from re-importing overlapping statements. Your matches, claims, and genuinely-unmatched transactions are not affected.`,
+        );
+        if (!ok) return;
+      }
+      setRemovingDuplicates(true);
+      setActionError("");
+      try {
+        const res = await fetch("/api/reconciliation/dedupe", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accountName }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          setActionError(err.error || `Failed to remove duplicates (${res.status})`);
+          return;
+        }
+        const data = (await res.json()) as {
+          removedHashes?: string[];
+          removedCount?: number;
+          rows?: string[][];
+        };
+        const removedSet = new Set(data.removedHashes ?? []);
+        statementCsvRowsByAccountRef.current = {
+          ...statementCsvRowsByAccountRef.current,
+          [accountName]: Array.isArray(data.rows)
+            ? data.rows
+            : statementCsvRowsByAccountRef.current[accountName] ?? [],
+        };
+        if (removedSet.size > 0) {
+          setMatchesByAccount((prev) => {
+            const next: Record<string, MatchResult[]> = {};
+            for (const [acct, rows] of Object.entries(prev)) {
+              next[acct] = rows.filter((m) => !removedSet.has(m.bankTransaction.hash));
+            }
+            return mergeWellsFargoBucketIntoChecking(next);
+          });
+        }
+        if (typeof window !== "undefined") {
+          const count = data.removedCount ?? 0;
+          window.alert(
+            count > 0
+              ? `Removed ${count} duplicate row${count === 1 ? "" : "s"} from ${accountName}.`
+              : `No already-reconciled duplicate rows were found for ${accountName}.`,
+          );
+        }
+      } catch (err) {
+        setActionError(err instanceof Error ? err.message : "Failed to remove duplicates.");
+      } finally {
+        setRemovingDuplicates(false);
+      }
+    },
+    [],
+  );
+
   const handleDisconnectSheetLink = useCallback(
     async (match: MatchResult) => {
       if (typeof window !== "undefined") {
@@ -4228,8 +4288,18 @@ export default function ReconcilePage() {
               )}
             </div>
             <section className="rounded-xl bg-[#252525] border border-charcoal-dark overflow-hidden">
-              <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark">
+              <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark flex items-center justify-between gap-3">
                 <h2 className="text-white font-semibold">Files</h2>
+                <button
+                  type="button"
+                  title="Remove redundant copies of transactions that are already matched or processed (left behind by re-importing overlapping statements). Your matches are not affected."
+                  onClick={() => void handleRemoveDuplicateRows(selectedAccount)}
+                  disabled={removingDuplicates}
+                  className="flex items-center gap-1.5 rounded-lg border border-charcoal-dark bg-[#2c2c2c] px-2.5 py-1 text-xs text-gray-300 hover:text-white hover:border-gray-500 transition-colors disabled:opacity-50"
+                >
+                  {removingDuplicates && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  Remove duplicate rows
+                </button>
               </div>
               <div className="p-3 text-sm">
                 {selectedAccountUploadedFiles.length === 0 ? (
