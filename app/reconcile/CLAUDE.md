@@ -28,7 +28,8 @@ Reconciliation produces a claim: a persistent link between a bank transaction ha
 | `app/api/reconciliation/user-dismissals/route.ts` | Sheet row dismissal CRUD |
 | `app/api/reconciliation/anchors/route.ts` | Account balance anchor CRUD |
 | `app/api/reconciliation/match-cache/route.ts` | Persist/restore MatchResult[] per account |
-| `app/api/reconciliation/csv-rows/route.ts` | Persist raw CSV rows per account |
+| `app/api/reconciliation/csv-rows/route.ts` | Persist raw CSV rows per account; **server-side identity merge** (`merge:true`) |
+| `app/api/reconciliation/dedupe/route.ts` | Remove already-reconciled duplicate CSV rows for an account (count-based) |
 | `app/api/reconciliation/uploaded-files/route.ts` | File upload history per account |
 | `app/api/reconciliation/memory/route.ts` | Merchant memory CRUD (GET all, POST upsert/increment, DELETE) |
 | `app/api/reconciliation/activity/route.ts` | Activity log fetch with `?since=` filter |
@@ -202,9 +203,11 @@ CREATE TABLE reconciliation_match_cache (
   PRIMARY KEY (account_name, bank_hash)
 );
 
--- Raw CSV rows per account, keyed by occurrence-indexed content hash.
--- Identical rows within one upload get keys "content", "content|1", "content|2", …
--- so duplicate transactions (same date/amount/description) are stored as separate rows.
+-- Raw CSV rows per account. dedupe_key is the transaction identity:
+-- "id:<hash>" for parseable rows (occurrence-disambiguated, so genuine in-file
+-- duplicates get distinct keys) or "raw:<cells>" for header/unparseable rows.
+-- Written by POST /csv-rows merge mode (replace) and POST /dedupe.
+-- (Legacy rows from the old append path used full-row content keys.)
 CREATE TABLE reconciliation_csv_rows (
   account_name TEXT NOT NULL,
   dedupe_key   TEXT NOT NULL,
@@ -316,6 +319,18 @@ The `#NNNN` tag preserves just enough of the stripped number to disambiguate dup
 ### CSV MIME Type (Windows)
 
 Windows browsers report `.csv` files with inconsistent MIME types (`text/plain`, `application/vnd.ms-excel`, `application/csv`, or `text/csv`). The dropzone accepts all four to avoid silent rejections. An `onDropRejected` handler surfaces a visible error for genuinely wrong file types.
+
+### Transaction Identity & CSV Dedup (server-side)
+
+CSV merge/dedup is keyed by **transaction identity** (date+amount+description, i.e. the hash) rather than the full raw CSV line. This prevents the same transaction from being stored twice when overlapping statements are re-imported and a *non-identifying* column differs (e.g. a running-balance column) — which previously produced a phantom `…-2` disambiguated hash that showed up as both matched and unmatched.
+
+Because `services/reconciliationService.ts` imports `node:crypto` it is **not browser-safe** (`page.tsx` imports only types from it), so the merge runs **server-side**:
+
+- `PROFILE_BY_ACCOUNT` (exported from the service; also imported by `match/route.ts`) maps a UI account → bank profile, e.g. `"WF Checking" → "Wells Fargo"`.
+- `computeCsvIdentityKeys(accountName, rows)` → one key per row: `id:<hash>` for rows that parse to a transaction (the hash is already occurrence-disambiguated, so genuine in-file duplicates get distinct keys), or an occurrence-indexed `raw:<cells>` key for header/unparseable rows (preserves header rows for Venmo/Capital One profile resolution).
+- `mergeCsvRowsByIdentity(accountName, existing, incoming)` → identity-merge with **max-count-per-identity** semantics: a re-imported transaction collapses onto its existing copy; a genuine second identical line is kept.
+
+**Caveat:** This prevents *new* duplicates at import time but does not retroactively collapse duplicates already stored from before the fix (once two same-identity rows exist, the disambiguator keeps both). Legacy duplicates are handled at the display layer (see `statementReviewRowsByAccount`) and by `POST /dedupe`.
 
 ---
 
@@ -498,6 +513,7 @@ bulkError: string               // error message after partial failure
 - **In:** `{ accountName, rows: string[][], sheetExpenses, sheetTransfers, processedHashes? }`
 - **Out:** `{ bankTransactions: BankTransaction[], matches: MatchResult[] }`
 - Fetches merchant memory for account, fetches existing claim links, restores claimed bank hashes as `exact_match`, runs `findMatches()` on the remainder
+- Imports `PROFILE_BY_ACCOUNT` from `services/reconciliationService.ts` (shared with the CSV identity helpers)
 
 ### `GET /api/reconciliation/claims`
 
@@ -561,11 +577,23 @@ bulkError: string               // error message after partial failure
 - **In:** `{ accountName, matches: MatchResult[], replace?: boolean }`
 - `replace: true` deletes all cache rows for account first
 
-### `POST /api/reconciliation/csv-rows`
+### `GET|POST /api/reconciliation/csv-rows`
 
-- **In:** `{ accountName, rows: string[][] }`
-- Stores raw CSV for re-matching after transfer claims
-- **Identical rows within a batch get occurrence-indexed dedupe keys** (`base`, `base|1`, `base|2`, …) so two truly identical CSV lines (same date/amount/description) are both stored and generate separate bank transactions
+- GET: `{ rowsByAccount: Record<string, string[][]> }` — all stored CSV rows per account
+- **POST `merge` mode** (`{ accountName, rows: incomingRows, merge: true }`) — the primary path used by `onDrop`:
+  - Reads existing stored rows, identity-merges incoming via `mergeCsvRowsByIdentity` (collapses re-imported transactions, keeps genuine duplicates)
+  - **Replaces** the account's stored rows with the merged set (DELETE rides with the first insert chunk; chunked at `CSV_SAVE_CHUNK_SIZE = 15`)
+  - Returns `{ rows: mergedRows }`
+  - Because the server reads existing rows from the table, there is no "upload before the in-memory ref loaded" race
+- **POST legacy append mode** (`{ accountName, rows }`, no `merge`) — occurrence-indexed full-row keys; kept only for the one-time localStorage migration
+
+### `POST /api/reconciliation/dedupe`
+
+- **In:** `{ accountName }`
+- Removes **already-reconciled duplicate** CSV rows: groups stored rows by base identity (hash without the `-N` suffix); an *unresolved* row is dropped when a same-identity sibling is **resolved** (claimed / transfer-claimed / processed / dismissed). Count-based, so genuine duplicates with no resolved sibling are preserved.
+- Replaces the account's stored CSV rows with the kept set and deletes the removed copies from `reconciliation_match_cache`
+- **Out:** `{ removedHashes, removedCount, rows }`
+- Triggered by the "Remove duplicate rows" button (`handleRemoveDuplicateRows`)
 
 ### `GET|POST|DELETE /api/reconciliation/uploaded-files`
 
@@ -595,6 +623,10 @@ bulkError: string               // error message after partial failure
 {viewMode === "accountDetail" && <upload zone + file list>}   // always top when in account detail
 {viewMode === "home" ? <home view> : <account detail sections>}
 ```
+
+The **Files** panel (top of account detail) lists uploaded files (✕ to clear each) plus two maintenance buttons in its header:
+- **Re-match from sheet** (`handleRematchFromSheet`) — runs `rematchAllStoredAccounts()` to re-link bank lines against the *current* sheet. Use after adding sheet expenses post-upload, or after a hash-change re-key. Exact matches move to Matched; the rest become suggested matches to bulk-approve.
+- **Remove duplicate rows** (`handleRemoveDuplicateRows`) — calls `POST /dedupe` for the selected account.
 
 Account detail sections (rendered in the ternary else branch):
 1. **Unmatched / Suggested** — rows needing manual review; includes filter chips + bulk approve UI
@@ -648,6 +680,12 @@ matchedSectionRef: RefObject<HTMLElement>   // ref to "Matched to sheet" section
 shouldScrollToMatched: boolean              // triggers scroll after upload
 ```
 
+**Maintenance buttons**
+```typescript
+rematching: boolean          // spinner on "Re-match from sheet"
+removingDuplicates: boolean  // spinner on "Remove duplicate rows"
+```
+
 **In-memory CSV (ref, not state)**
 ```typescript
 statementCsvRowsByAccountRef.current: Record<string, string[][]>
@@ -659,7 +697,7 @@ Used by `rematchAllStoredAccounts()` — survives re-renders without triggering 
 **`userInputtedEntries`** — combines expenses + transfers, marks each as "completed" if:
 - Claimed to a bank hash, OR auto-matched by exact match, OR transfer is auto-completed, OR user-dismissed
 
-**`statementReviewRowsByAccount`** — bank transactions needing manual review (unmatched, suggested, questionable, transfer). Excludes `processed` unless disconnected.
+**`statementReviewRowsByAccount`** — bank transactions needing manual review (unmatched, suggested, questionable, transfer). Excludes `processed` unless disconnected. Also applies **count-based duplicate suppression**: a pending row is hidden when the same transaction identity (base hash, ignoring the `-N` suffix) already appears as a matched/closed row for that account — preventing the same bank transaction from showing in both the Unmatched and Matched sections. Count-based so genuine duplicate purchases (no resolved sibling) are still shown. (Note: this only suppresses against matched rows currently *loaded*; matched rows older than the match-cache window aren't loaded — see hash-change recovery in Gotchas.)
 
 **`statementAutoMatchedRowsByAccount`** — `exact_match` rows with linked sheet entries (`hasLinkedUserInputtedEntry`).
 
@@ -717,15 +755,25 @@ Used by `rematchAllStoredAccounts()` — survives re-renders without triggering 
 
 ### `onDrop(files)`
 
-1. Parses CSV with PapaParse; merges with existing stored CSV rows using **occurrence-indexed dedup** so identical rows are both kept
-2. Generates `csvUploadId` UUID for audit grouping
+1. Parses CSV with PapaParse, then POSTs to `/csv-rows` **`merge` mode** — the server identity-merges with stored rows, persists the replaced set, and returns `mergedCsv` (the client no longer merges or hashes; the old client-side `mergeCsvRowArrays`/`csvRowDedupeKey` were removed)
+2. Generates `csvUploadId` UUID for audit grouping; sets `statementCsvRowsByAccountRef.current[account] = mergedCsv`
 3. Fetches fresh sheet data + all Neon state (processed hashes, claims, dismissals)
-4. POST `/match` with merged CSV + fresh sheet data
+4. POST `/match` with `mergedCsv` + fresh sheet data
 5. Auto-approves all `exact_match` rows (calls `persistProcessedHash` with `csvUploadId`)
 6. `setMatchesByAccount` with new results; `setShouldScrollToMatched(true)` triggers scroll to matched section
-7. POST `/match-cache` + `/csv-rows` to Neon (independent; one failure doesn't block the other)
+7. POST `/match-cache` to Neon (CSV rows were already persisted by the merge in step 1 — no separate `/csv-rows` save)
 8. `setProcessedHashes` updated with auto-approved hashes
 9. POST `/uploaded-files` with file name **and `bankHashes`** (all tx hashes from this upload) so the file can later be selectively cleared
+
+### `handleRematchFromSheet()`
+
+- Confirms, then calls `rematchAllStoredAccounts()` (re-matches every stored account against the current sheet, `replace`-saving the match cache)
+- Used to pick up sheet expenses added after upload, or to rebuild the view after a hash-change re-key
+
+### `handleRemoveDuplicateRows(accountName)`
+
+- Confirms, then `POST /dedupe`; removes the returned `removedHashes` from `matchesByAccount` and updates `statementCsvRowsByAccountRef` with the returned cleaned rows
+- Reports how many rows were removed
 
 ### `handleClearFile(accountName, fileName)`
 
@@ -806,11 +854,39 @@ Used by `rematchAllStoredAccounts()` — survives re-renders without triggering 
 4. File disappears from the Files list; affected transactions drop out of the matched/closed sections
 5. Re-upload the file to re-reconcile from scratch
 
+### Re-match an Account Against the Current Sheet
+
+Use when you added/edited sheet expenses *after* uploading a statement, so the cached matches are stale and bank lines sit in "Unmatched" despite having a matching expense.
+
+1. Open the account; click **Re-match from sheet** (Files panel header)
+2. `rematchAllStoredAccounts()` re-runs `/match` for every stored account against the current sheet and `replace`-saves the cache
+3. Exact same-day matches auto-link; the rest become suggested matches → clear them with Bulk Approve (Suggested filter)
+
+### Remove Already-Reconciled Duplicate Rows
+
+Use when overlapping legacy uploads left duplicate copies of already-matched transactions in "Unmatched".
+
+1. Open the account; click **Remove duplicate rows**
+2. `POST /dedupe` drops unresolved CSV rows whose identity already has a resolved sibling (count-based) and clears their match-cache entries
+3. The duplicates leave the Unmatched section; genuine still-unmatched transactions remain
+
+### Recovering Orphaned Records After a Hash Change
+
+When a `cleanBankDescription`/hash change orphans claim/processed records (reconciled transactions reappear as "Unmatched / No candidate match"), re-key the old hashes to the current ones instead of clearing:
+
+1. Confirm scope with a read-only check: for each account, parse stored `csv_rows` with the **current** `mapBankRowsToTransactions` (current hashes) and with the **old** module version (`git show <pre-change-commit>:services/reconciliationService.ts`) to get old hashes; align old→new by the shared `tx.raw` row reference. Count how many `claim_links.bank_hash` / `processed_transactions.hash` are orphaned vs recoverable. (Top-level await isn't supported under tsx's cjs transform — wrap the script in an `async main()`.)
+2. Re-key (one-off `tsx` script against `DATABASE_URL`): for each unambiguous old→new pair, `UPDATE` the hash in `reconciliation_claim_links`, `processed_transactions`, `reconciliation_transfer_claim_links`, `reconciliation_statement_dismissals`. **Conflict-safe:** if the new hash already exists in a table, `DELETE` the redundant old row instead of updating (avoids PK/unique violations). Wrap each account's writes in `sql.transaction([...])` so it's atomic and idempotent (re-runnable).
+3. Have the user click **Re-match from sheet** so the cache rebuilds and the re-keyed claims restore as `exact_match`.
+
+This was used to recover WF Checking (92 claims + 101 processed, 0 ambiguous mappings) without re-doing any reconciliation. Hash inputs are unchanged by the re-key, so going forward records stay valid.
+
 ---
 
 ## Important Invariants & Gotchas
 
-- **Hash stability is critical.** All existing Neon records key off SHA256(date|amount|cleaned-description). The cleaned description now includes `#NNNN` suffix tags for stripped long digit sequences (e.g., `"DELTA #9836"`). Any future change to `cleanBankDescription` will change hashes and orphan existing Neon claim and processed records — use `handleClearFile` or the Reset button to recover.
+- **Hash stability is critical.** All existing Neon records key off SHA256(date|amount|cleaned-description). The cleaned description now includes `#NNNN` suffix tags for stripped long digit sequences (e.g., `"DELTA #9836"`). Any change to `cleanBankDescription` changes hashes and **orphans** existing claim/processed/transfer-claim/dismissal records — they point at hashes the current parser no longer produces. Symptom: transactions you already reconciled reappear in "Unmatched" with "No candidate match" (the linked sheet expense is still flagged claimed, so it's excluded from the matching pool). **Prefer re-keying over clear/Reset** so months of work aren't lost — see "Recovering orphaned records after a hash change".
+
+  Known incident: commit `d1077b9` changed `cleanBankDescription` (long digit sequences went from *removed* → tagged `#NNNN`). This only affected Wells Fargo descriptions (the long auth codes) and orphaned ~92 WF Checking claims + ~101 processed records, recovered by the re-key below.
 
 - **One expense row per claim.** `UNIQUE(sheet_name, sheet_row_id)` on `reconciliation_claim_links`. Attempting to link the same sheet row to two bank hashes returns 409.
 
@@ -834,7 +910,7 @@ Used by `rematchAllStoredAccounts()` — survives re-renders without triggering 
 
 - **Amount sign convention.** Bank amounts are signed: negative = debit/outgoing, positive = credit/incoming. Sheet expense amounts are always positive. Transfer amounts are positive; directionality comes from `transferFrom`/`transferTo`.
 
-- **CSV merge strategy.** New upload for an account that already has stored rows merges using occurrence-indexed keys. Identical rows within the same incoming batch get keys `base`, `base|1`, `base|2`, … so two truly identical lines (same date/amount/description) are both kept and generate separate bank transactions. Re-uploading the same file overwrites the same occurrence slots, so row counts remain stable across re-uploads.
+- **CSV merge strategy (server-side, identity-based).** New uploads are merged on the server (`POST /csv-rows` `merge` mode) by **transaction identity** (date+amount+description), not by full raw row. Re-importing an overlapping statement collapses the repeated transaction onto its existing copy even when a non-identifying column (e.g. running balance) differs; genuine duplicate lines within one file are still kept (distinct occurrence-disambiguated hashes). The client no longer merges/hashes (the service is not browser-safe). See "Transaction Identity & CSV Dedup". Legacy duplicates already in storage are not auto-collapsed — use **Remove duplicate rows** / `POST /dedupe`.
 
 - **`isProcessedWithoutNeonClaim`** — returns true if a bank hash is in `processedHashes` AND not in `bankHashesWithNeonClaim` AND not dismissed. These rows appear in the review section (not matched), flagged as needing re-reconciliation.
 

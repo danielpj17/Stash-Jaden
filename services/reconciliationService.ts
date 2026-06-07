@@ -705,6 +705,12 @@ export async function findMatches(
 
   const AUTO_SCORE_THRESHOLD = 1.0;
   const AUTO_SCORE_MARGIN = 0.3;
+  // When exactly one unclaimed sheet expense has the bank line's exact amount,
+  // the amount alone is strong evidence — auto-match it even with weak
+  // description overlap, as long as it falls within this date window (posting
+  // lag / logging delay). Ambiguous (multiple same-amount) candidates still
+  // require manual approval.
+  const UNIQUE_AMOUNT_AUTO_DAY_WINDOW = 14;
 
   const consumedRowIds = new Set<string>();
   const results: MatchResult[] = [];
@@ -874,18 +880,28 @@ export async function findMatches(
       const bestConsumed = best.rowId ? consumedRowIds.has(best.rowId) : false;
       const margin = second ? best.score - second.score : Infinity;
 
+      // A single unclaimed expense at this exact amount, close enough in date:
+      // the amount uniqueness carries the match even when descriptions diverge.
+      const isUniqueAmountCandidate = scoredCandidates.length === 1;
+      const withinUniqueWindow =
+        best.dayDistance !== null && best.dayDistance <= UNIQUE_AMOUNT_AUTO_DAY_WINDOW;
+      const uniqueAmountAutoMatch = isUniqueAmountCandidate && withinUniqueWindow;
+
       const shouldAutoMatch =
-        best.score >= AUTO_SCORE_THRESHOLD &&
-        margin >= AUTO_SCORE_MARGIN &&
         !isCluster &&
-        !bestConsumed;
+        !bestConsumed &&
+        ((best.score >= AUTO_SCORE_THRESHOLD && margin >= AUTO_SCORE_MARGIN) ||
+          uniqueAmountAutoMatch);
 
       if (shouldAutoMatch) {
         if (best.rowId) consumedRowIds.add(best.rowId);
+        const reason = uniqueAmountAutoMatch
+          ? `Auto Match: only unclaimed expense at this amount within ${UNIQUE_AMOUNT_AUTO_DAY_WINDOW} days (${best.dayDistance}d apart, score ${best.score.toFixed(2)}).`
+          : `Auto Match: amount-first scoring (score ${best.score.toFixed(2)}, margin ${margin === Infinity ? "∞" : margin.toFixed(2)}).`;
         results.push({
           bankTransaction: tx,
           matchType: "exact_match",
-          reason: `Auto Match: amount-first scoring (score ${best.score.toFixed(2)}, margin ${margin === Infinity ? "∞" : margin.toFixed(2)}).`,
+          reason,
           matchedSheetExpense: best.row,
           matchedSheetIndex: best.index >= 0 ? best.index : undefined,
           confidenceScore: best.score,
