@@ -46,6 +46,34 @@ import {
 
 type MonthlyBudgets = Record<string, Record<string, number>>;
 
+/**
+ * Caches the full budget store in localStorage so the dashboard renders real budget
+ * amounts on the first paint of a return visit — mirroring how expenses/transfers are
+ * cached in ExpensesDataContext. Without this, budgets sit at $0 until /api/budget lands
+ * and every category briefly looks overbudget.
+ */
+const BUDGET_CACHE_KEY = "stash_budgets_v1";
+
+function readBudgetCache(): MonthlyBudgets | null {
+  try {
+    const raw = localStorage.getItem(BUDGET_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    return parsed as MonthlyBudgets;
+  } catch {
+    return null;
+  }
+}
+
+function writeBudgetCache(data: MonthlyBudgets) {
+  try {
+    localStorage.setItem(BUDGET_CACHE_KEY, JSON.stringify(data));
+  } catch {
+    // localStorage full or unavailable — silently skip
+  }
+}
+
 function resolveBudgetForMonth(
   month: string,
   allBudgets: MonthlyBudgets | null,
@@ -315,7 +343,14 @@ export default function BudgetPage() {
   const { refreshKey, triggerRefresh } = useRefresh();
   const { allRows, allTransfers, loading, error } = useExpensesData();
 
-  const [allBudgets, setAllBudgets] = useState<MonthlyBudgets | null>(null);
+  const [allBudgets, setAllBudgets] = useState<MonthlyBudgets | null>(() => {
+    if (typeof window === "undefined") return null;
+    return readBudgetCache();
+  });
+  // True only once budgets are confirmed loaded from the server this session. Cached budgets
+  // are shown immediately, but editing/saving stays blocked until this is true — a save PUTs
+  // the entire store, so we must not overwrite Neon based on stale cache.
+  const [budgetsConfirmed, setBudgetsConfirmed] = useState(false);
   const [budgetError, setBudgetError] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [editBudgetValue, setEditBudgetValue] = useState("");
@@ -365,7 +400,8 @@ export default function BudgetPage() {
           Array.isArray(data) ||
           "error" in (data as Record<string, unknown>);
         if (loadFailed) {
-          setAllBudgets(null);
+          // Keep any cache-hydrated budgets on screen (don't blank back to $0/overbudget).
+          // budgetsConfirmed stays false so editing remains blocked.
           const errMsg = (data as { error?: unknown } | null)?.error;
           setBudgetError(
             typeof errMsg === "string"
@@ -407,7 +443,11 @@ export default function BudgetPage() {
               if (res.ok) {
                 localStorage.removeItem(BUDGET_STORAGE_KEY);
                 const saved = (await res.json()) as MonthlyBudgets;
-                if (!cancelled) setAllBudgets(saved);
+                if (!cancelled) {
+                  setAllBudgets(saved);
+                  writeBudgetCache(saved);
+                  setBudgetsConfirmed(true);
+                }
                 return;
               }
             }
@@ -417,12 +457,14 @@ export default function BudgetPage() {
         }
         if (!cancelled) {
           setAllBudgets(data as MonthlyBudgets);
+          writeBudgetCache(data as MonthlyBudgets);
+          setBudgetsConfirmed(true);
           setBudgetError(null);
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setAllBudgets(null);
+          // Keep cache-hydrated budgets on screen; leave budgetsConfirmed false so editing stays blocked.
           setBudgetError(
             "Couldn't load saved budgets. Refresh before editing — saving now would overwrite them."
           );
@@ -583,7 +625,7 @@ export default function BudgetPage() {
     // Saving replaces the ENTIRE budget store in Neon. If budgets haven't finished
     // loading (null) we don't have the other months/categories in memory, so writing
     // now would wipe them. Refuse and tell the user to refresh.
-    if (allBudgets === null) {
+    if (!budgetsConfirmed || allBudgets === null) {
       setBudgetError(
         "Budgets haven't loaded yet. Refresh the page before editing to avoid overwriting your saved budgets."
       );
@@ -611,13 +653,15 @@ export default function BudgetPage() {
         setBudgetError(msg);
         return;
       }
-      setAllBudgets((body as MonthlyBudgets) ?? next);
+      const savedBudgets = (body as MonthlyBudgets) ?? next;
+      setAllBudgets(savedBudgets);
+      writeBudgetCache(savedBudgets);
       setBudgetError(null);
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Failed to save budget. Try again.";
       setBudgetError(msg);
     }
-  }, [selectedCategory, selectedMonth, editBudgetValue, allBudgets]);
+  }, [selectedCategory, selectedMonth, editBudgetValue, allBudgets, budgetsConfirmed]);
 
   const handleSubmitTransfer = useCallback(async () => {
     const num = parseFloat(tfAmount.replace(/,/g, ""));
@@ -1270,14 +1314,14 @@ export default function BudgetPage() {
                         value={editBudgetValue}
                         onChange={(e) => setEditBudgetValue(e.target.value)}
                         onKeyDown={(e) => { if (e.key === "Enter") handleSaveBudget(); }}
-                        disabled={allBudgets === null}
+                        disabled={!budgetsConfirmed}
                         className="flex-1 min-w-0 px-3 py-1.5 rounded-lg bg-charcoal border border-charcoal-dark text-gray-200 focus:border-accent focus:ring-1 focus:ring-accent outline-none text-sm disabled:opacity-50 disabled:cursor-not-allowed"
                       />
                       <button
                         type="button"
                         onClick={handleSaveBudget}
-                        disabled={allBudgets === null}
-                        title={allBudgets === null ? "Budgets are still loading — refresh before editing" : undefined}
+                        disabled={!budgetsConfirmed}
+                        title={!budgetsConfirmed ? "Budgets are still loading — refresh before editing" : undefined}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent-dark transition-colors shrink-0 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-accent"
                       >
                         <Save className="w-3.5 h-3.5" />
