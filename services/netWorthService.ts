@@ -1,5 +1,4 @@
 import { getExpenses, getTransfers } from "@/services/sheetsApi";
-import { getLatestSnaptradeBalances } from "@/services/snaptradeApi";
 
 const ASSETS_API = "/api/assets";
 const LIABILITIES_API = "/api/liabilities";
@@ -65,19 +64,22 @@ function sumValues(items: Array<{ value: number }>): number {
   return items.reduce((sum, item) => sum + asFiniteNumber(item.value), 0);
 }
 
-export async function getNetWorthSummary(month?: string): Promise<NetWorthSummary> {
-  const [balancesData, manualAssets, manualLiabilities, expenses, transfers] = await Promise.all([
-    getLatestSnaptradeBalances(),
+/**
+ * @param liquidAssetsTotal Sum of the user's data-driven account balances
+ *   (computeAccountBalances). Passed in by the caller since the accounts list
+ *   lives in React context. Defaults to 0 when unknown.
+ */
+export async function getNetWorthSummary(
+  month?: string,
+  liquidAssetsTotal = 0
+): Promise<NetWorthSummary> {
+  const [manualAssets, manualLiabilities, expenses, transfers] = await Promise.all([
     fetchJson<ManualAsset[]>(ASSETS_API),
     fetchJson<ManualLiability[]>(LIABILITIES_API),
     getExpenses(month),
     getTransfers(month),
   ]);
 
-  const liquidAssetsTotal = Object.values(balancesData.balances).reduce(
-    (sum, amount) => sum + asFiniteNumber(amount),
-    0
-  );
   const fixedAssetsTotal = sumValues(manualAssets);
   const liabilitiesTotal = sumValues(manualLiabilities);
 

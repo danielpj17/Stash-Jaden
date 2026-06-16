@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { neon } from "@neondatabase/serverless";
-import { computeCsvIdentityKeys } from "@/services/reconciliationService";
+import {
+  computeCsvIdentityKeys,
+  getCsvParseOptionsForAccount,
+} from "@/services/reconciliationService";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -70,7 +73,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, removedHashes: [], removedCount: 0, rows: [] });
     }
 
-    const keys = computeCsvIdentityKeys(accountName, existing);
+    const csvOpts = await getCsvParseOptionsForAccount(accountName);
+    const keys = computeCsvIdentityKeys(accountName, existing, csvOpts);
     const resolvedHashes = await getResolvedHashes(sql, accountName);
 
     // Group parseable rows by base identity (hash without the -N suffix).

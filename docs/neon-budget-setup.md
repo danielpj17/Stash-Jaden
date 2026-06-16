@@ -1,94 +1,21 @@
-# Neon budget storage setup
+# Neon database setup
 
-Budget data is stored in Neon Postgres so it syncs across devices. Run this SQL once in the Neon SQL editor after creating your project and database.
+Stash stores accounts, budgets, manual assets/liabilities, and all reconciliation
+state in Neon Postgres. Run the setup SQL once after creating your project.
 
-1. In [Neon](https://neon.tech), create a project and copy the **connection string**. Use the **pooled** (Transaction mode) connection string for Next.js/serverless.
-2. Add it to `.env.local`: `DATABASE_URL=postgresql://...` (no quotes around the value).
-3. In Neon Dashboard → SQL Editor, paste the entire contents of [`docs/neon-budget-setup.sql`](./neon-budget-setup.sql) and run. (The block below is the same SQL inline for reference — but copy from the `.sql` file to avoid Markdown syntax sneaking in.)
+1. In [Neon](https://neon.tech), create a project and copy the **connection string**.
+   Use the **pooled** (Transaction mode) string for Next.js/serverless.
+2. Add it to `.env` (or `.env.local`): `DATABASE_URL=postgresql://...` (no quotes around the value).
+3. In Neon Dashboard → SQL Editor, paste the entire contents of
+   [`docs/neon-setup.sql`](./neon-setup.sql) and run. It is the **single, complete,
+   copy-pasteable schema** for every table the app uses, and is safe to re-run
+   (every statement is idempotent).
+4. Restart your dev server.
 
-```sql
-CREATE TABLE IF NOT EXISTS budget_store (
-  id integer primary key default 1,
-  data jsonb not null default '{}'
-);
+Notes:
 
-INSERT INTO budget_store (id, data) VALUES (1, '{}')
-ON CONFLICT (id) DO NOTHING;
-
-CREATE TABLE IF NOT EXISTS processed_transactions (
-  hash TEXT PRIMARY KEY,
-  account_name TEXT,
-  processed_at TIMESTAMP DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS account_anchors (
-  account_name TEXT PRIMARY KEY,
-  confirmed_balance NUMERIC,
-  as_of_date DATE
-);
-
-CREATE TABLE IF NOT EXISTS reconciliation_claim_links (
-  bank_hash TEXT NOT NULL,
-  account_name TEXT,
-  sheet_name TEXT NOT NULL DEFAULT 'Expenses',
-  sheet_row_id TEXT NOT NULL,
-  amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
-  created_at TIMESTAMP DEFAULT now(),
-  PRIMARY KEY (bank_hash, sheet_name, sheet_row_id),
-  UNIQUE (sheet_name, sheet_row_id)
-);
-
-CREATE TABLE IF NOT EXISTS reconciliation_transfer_claim_links (
-  transfer_sheet_row_id TEXT NOT NULL,
-  bank_hash TEXT NOT NULL,
-  bank_account_name TEXT,
-  bank_amount_cents INTEGER NOT NULL,
-  expected_legs INTEGER NOT NULL DEFAULT 2 CHECK (expected_legs IN (1, 2)),
-  created_at TIMESTAMP DEFAULT now(),
-  PRIMARY KEY (transfer_sheet_row_id, bank_hash),
-  UNIQUE (bank_hash)
-);
-
-CREATE TABLE IF NOT EXISTS reconciliation_statement_dismissals (
-  hash TEXT NOT NULL,
-  account_name TEXT NOT NULL,
-  note TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT now(),
-  PRIMARY KEY (hash, account_name)
-);
-
--- Merchant memory: tracks recurring patterns to auto-claim after 2+ confirmations.
--- Phase 4 of reconcile improvements.
-CREATE TABLE IF NOT EXISTS reconciliation_merchant_memory (
-  fingerprint TEXT NOT NULL,
-  bank_account_name TEXT NOT NULL,
-  sheet_category TEXT,
-  sheet_account TEXT,
-  confirmed_count INTEGER NOT NULL DEFAULT 1,
-  last_confirmed_at TIMESTAMP DEFAULT now(),
-  PRIMARY KEY (fingerprint, bank_account_name)
-);
-
--- Persistent audit log of every reconciliation action.
--- Used by the Activity tab to provide per-action and per-CSV-upload undo.
--- Never auto-purged — full history is the user's source of truth.
-CREATE TABLE IF NOT EXISTS reconciliation_activity_log (
-  id UUID PRIMARY KEY,
-  occurred_at TIMESTAMP NOT NULL DEFAULT now(),
-  action_type TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  csv_upload_id UUID,
-  bulk_action_id UUID,
-  parent_action_id UUID,
-  payload JSONB NOT NULL,
-  reverted_at TIMESTAMP,
-  reverted_by_action_id UUID
-);
-CREATE INDEX IF NOT EXISTS idx_activity_log_occurred
-  ON reconciliation_activity_log(occurred_at DESC);
-CREATE INDEX IF NOT EXISTS idx_activity_log_csv
-  ON reconciliation_activity_log(csv_upload_id);
-```
-
-4. Run the manual assets/liabilities setup script from `docs/neon-manual-assets-liabilities.sql` in the same SQL editor.
-5. Restart your dev server.
+- The API routes also auto-create/upgrade their tables on first use, so this script
+  is a convenience/reference — but keep `neon-setup.sql` as the canonical schema and
+  update it whenever a table or column changes.
+- To wipe all data back to a blank slate, use
+  [`docs/neon-blank-slate-reset.sql`](./neon-blank-slate-reset.sql) (destructive).

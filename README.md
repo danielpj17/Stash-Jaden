@@ -5,12 +5,12 @@ A responsive financial dashboard built with **Next.js 14**, **Tailwind CSS**, an
 ## Features
 
 - **Sidebar navigation**: New Expense, Expenses (default), Budget, Net Worth
-- **Month selector**: Dropdown in the top right (January 2026 – December 2026, plus Full Year 2026)
+- **Month selector**: Dropdown in the top right
 - **Responsive layout**: Collapsible sidebar on desktop; drawer overlay on mobile
 - **Theme**: Charcoal (`#1E1E1E`) with light blue accent (`#7BC0FF`)
-- **Google Sheets backend**: Optional; connect via a Google Apps Script Web App (see below).
-- **Budget goals**: Stored in the browser (localStorage).
-- **SnapTrade manual refresh**: Account Balances card can pull live brokerage balances on demand.
+- **Blank-slate accounts**: Define your own accounts (checking, savings, cash, credit, brokerage) on the Net Worth page — no hard-coded accounts or balances.
+- **Self-mapping CSV upload**: Reconcile any bank's CSV — the app auto-detects the column layout and lets you confirm/override a mapping per account.
+- **Google Sheets backend**: Connect your own sheet via a Google Apps Script Web App (see below).
 
 ## Google Sheets backend
 
@@ -38,23 +38,17 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000).
 
-## SnapTrade manual account-balance refresh
+## Database setup
 
-The Budget page Account Balances card includes a refresh button in the card header. It only
-fetches SnapTrade balances when clicked (no polling, no automatic refresh on page load).
+Paste the single schema file `docs/neon-setup.sql` into the Neon SQL editor and run it
+(it's idempotent and contains every table). The app also auto-creates/upgrades these
+tables on first use of each route.
 
-Add these server-side env vars:
+## Accounts
 
-```bash
-SNAPTRADE_CLIENT_ID=...
-SNAPTRADE_CONSUMER_KEY=...
-SNAPTRADE_USER_ID=...
-SNAPTRADE_USER_SECRET=...
-```
-
-The app calls `/api/snaptrade/refresh-balances` and overlays live values for supported
-brokerages (currently Fidelity, Robinhood, and Charles Schwab) while keeping other accounts
-from local budget math.
+Add your accounts on the **Net Worth** page (Accounts section). Each account has a type, an
+opening balance + as-of date, and an optional per-account CSV column mapping used by reconciliation.
+Name an account to match your existing sheet/reconcile names to keep prior history attached.
 
 ## Scripts
 

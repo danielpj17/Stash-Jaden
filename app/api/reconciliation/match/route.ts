@@ -3,6 +3,7 @@ import { neon } from "@neondatabase/serverless";
 import {
   findMatches,
   mapBankRowsToTransactions,
+  getCsvParseOptionsForAccount,
   PROFILE_BY_ACCOUNT,
   type MerchantMemoryEntry,
   type SheetExpenseLike,
@@ -268,7 +269,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "accountName is required" }, { status: 400 });
   }
 
-  const profileAccount = PROFILE_BY_ACCOUNT[accountName] ?? accountName;
+  const csvOpts = await getCsvParseOptionsForAccount(accountName);
+  const profileAccount = csvOpts ? accountName : (PROFILE_BY_ACCOUNT[accountName] ?? accountName);
   const rows = normalizeCsvRows(body.rows);
   const sheetExpenses = normalizeSheetExpenses(body.sheetExpenses);
   const sheetTransfers = normalizeSheetTransfers(body.sheetTransfers);
@@ -276,7 +278,7 @@ export async function POST(request: NextRequest) {
     ? body.processedHashes.map((h) => String(h))
     : undefined;
 
-  const bankTransactions = mapBankRowsToTransactions(profileAccount, rows).map((tx) => ({
+  const bankTransactions = mapBankRowsToTransactions(profileAccount, rows, csvOpts).map((tx) => ({
     ...tx,
     accountName,
   }));

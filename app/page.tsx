@@ -2,17 +2,16 @@
 
 import { useEffect, useState, useMemo, useCallback } from "react";
 import Link from "next/link";
-import { X, Save, PlusCircle, Loader2, Plus, RefreshCw } from "lucide-react";
+import { X, Save, PlusCircle, Loader2, Plus } from "lucide-react";
 import DashboardLayout from "@/components/DashboardLayout";
 import MonthDropdown from "@/components/MonthDropdown";
 import GlassDropdown from "@/components/GlassDropdown";
 import { useMonth } from "@/contexts/MonthContext";
 import { useRefresh } from "@/contexts/RefreshContext";
 import { useExpensesData } from "@/contexts/ExpensesDataContext";
+import { useAccounts } from "@/contexts/AccountsContext";
 import { rowMatchesMonth, transferMatchesMonth, submitTransfer } from "@/services/sheetsApi";
 import type { SheetRow } from "@/services/sheetsApi";
-import { getLatestSnaptradeBalances, refreshSnaptradeBalances } from "@/services/snaptradeApi";
-import type { SupportedBroker, RefreshSnaptradeBalancesResponse } from "@/services/snaptradeApi";
 import {
   EXPENSE_CATEGORIES,
   CATEGORY_COLORS,
@@ -155,19 +154,6 @@ function formatDateMMDDYY(timestamp?: string): string {
   return d.toLocaleDateString("en-US", { month: "2-digit", day: "2-digit", year: "2-digit" });
 }
 
-function formatDateTimeMMDDYYHM(timestamp?: string): string {
-  if (!timestamp) return "\u2014";
-  const d = new Date(timestamp);
-  if (Number.isNaN(d.getTime())) return "\u2014";
-  return d.toLocaleString("en-US", {
-    month: "2-digit",
-    day: "2-digit",
-    year: "2-digit",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
 type DailyPoint = { label: string; amount: number };
 
 function getWeekStartDate(date: Date): Date {
@@ -192,7 +178,7 @@ function formatLocalDateKey(date: Date): string {
 function getDaysInSelectedMonth(selectedMonth: string): number[] {
   const monthNum = Number(selectedMonth);
   if (!Number.isFinite(monthNum) || monthNum < 1 || monthNum > 12) return [];
-  const year = 2026;
+  const year = new Date().getFullYear();
   const lastDay = new Date(year, monthNum, 0).getDate();
   const now = new Date();
   const isCurrentMonth = now.getFullYear() === year && now.getMonth() + 1 === monthNum;
@@ -286,48 +272,9 @@ const fmtDollars = (n: number) =>
   "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const chartMargin = { top: 6, right: 6, bottom: 6, left: 2 };
 
-const TRANSFER_FROM_OPTIONS = [
-  "WF Checking",
-  "WF Savings",
-  "Venmo - Daniel",
-  "Venmo - Katie",
-  "Fidelity",
-  "Robinhood",
-  "My529",
-  "Charles Schwab",
-  "Ally",
-  "Capital One",
-  "America First",
-  "Discover",
-  "Parents",
-  "Cash",
-] as const;
-
-const TRANSFER_TO_OPTIONS = [
-  "WF Checking",
-  "WF Savings",
-  "Venmo - Daniel",
-  "Venmo - Katie",
-  "Fidelity",
-  "Robinhood",
-  "My529",
-  "Charles Schwab",
-  "Ally",
-  "Capital One",
-  "America First",
-  "Discover",
-  "Cash",
-  "Misc.",
-] as const;
-
-const TRANSFER_FROM_DROPDOWN_OPTIONS = TRANSFER_FROM_OPTIONS.map((opt) => ({
-  value: opt,
-  label: opt,
-}));
-const TRANSFER_TO_DROPDOWN_OPTIONS = TRANSFER_TO_OPTIONS.map((opt) => ({
-  value: opt,
-  label: opt,
-}));
+// Non-account transfer endpoints (always available alongside the user's accounts).
+const TRANSFER_FROM_SENTINELS = ["Parents", "Cash"] as const;
+const TRANSFER_TO_SENTINELS = ["Cash", "Misc."] as const;
 
 const gridStroke = "rgba(255,255,255,0.06)";
 const axisStroke = "#9ca3af";
@@ -342,6 +289,26 @@ export default function BudgetPage() {
   const { selectedMonth, selectedLabel } = useMonth();
   const { refreshKey, triggerRefresh } = useRefresh();
   const { allRows, allTransfers, loading, error } = useExpensesData();
+  const { accounts, accountNames } = useAccounts();
+
+  const accountSeeds = useMemo(
+    () =>
+      accounts.map((a) => ({
+        name: a.name,
+        openingBalance: a.openingBalance,
+        openingBalanceDate: a.openingBalanceDate,
+      })),
+    [accounts]
+  );
+
+  const transferFromOptions = useMemo(
+    () => [...accountNames, ...TRANSFER_FROM_SENTINELS].map((opt) => ({ value: opt, label: opt })),
+    [accountNames]
+  );
+  const transferToOptions = useMemo(
+    () => [...accountNames, ...TRANSFER_TO_SENTINELS].map((opt) => ({ value: opt, label: opt })),
+    [accountNames]
+  );
 
   const [allBudgets, setAllBudgets] = useState<MonthlyBudgets | null>(() => {
     if (typeof window === "undefined") return null;
@@ -363,11 +330,7 @@ export default function BudgetPage() {
   const [tfAmount, setTfAmount] = useState("");
   const [tfStatus, setTfStatus] = useState<"idle" | "submitting" | "error">("idle");
   const [tfError, setTfError] = useState("");
-  const [liveBrokerBalances, setLiveBrokerBalances] = useState<Partial<Record<SupportedBroker, number>>>({});
   const [accountAnchors, setAccountAnchors] = useState<AccountAnchor[]>([]);
-  const [balancesFetchedAt, setBalancesFetchedAt] = useState<string | null>(null);
-  const [balancesRefreshStatus, setBalancesRefreshStatus] = useState<"idle" | "refreshing" | "error">("idle");
-  const [balancesRefreshError, setBalancesRefreshError] = useState("");
 
   const rows = useMemo(
     () => allRows.filter((r) => rowMatchesMonth(r, selectedMonth)),
@@ -471,22 +434,6 @@ export default function BudgetPage() {
         }
       });
     return () => { cancelled = true; };
-  }, [refreshKey]);
-
-  useEffect(() => {
-    let cancelled = false;
-    getLatestSnaptradeBalances()
-      .then((data: RefreshSnaptradeBalancesResponse) => {
-        if (cancelled) return;
-        setLiveBrokerBalances(data.balances);
-        setBalancesFetchedAt(data.fetchedAt);
-      })
-      .catch(() => {
-        /* keep last local values */
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [refreshKey]);
 
   useEffect(() => {
@@ -604,8 +551,8 @@ export default function BudgetPage() {
   );
 
   const accountBalances = useMemo(() => {
-    return computeAccountBalances(allRows, allTransfers, liveBrokerBalances, accountAnchors);
-  }, [allRows, allTransfers, liveBrokerBalances, accountAnchors]);
+    return computeAccountBalances(accountSeeds, allRows, allTransfers, accountAnchors);
+  }, [accountSeeds, allRows, allTransfers, accountAnchors]);
 
   const visibleAccountBalances = useMemo(() => {
     return Object.entries(accountBalances).filter(
@@ -689,23 +636,6 @@ export default function BudgetPage() {
       setTfError(err instanceof Error ? err.message : "Failed to submit transfer.");
     }
   }, [tfFrom, tfTo, tfAmount, triggerRefresh]);
-
-  const handleRefreshAccountBalances = useCallback(async () => {
-    setBalancesRefreshStatus("refreshing");
-    setBalancesRefreshError("");
-    try {
-      const data = await refreshSnaptradeBalances();
-      setLiveBrokerBalances(data.balances);
-      setBalancesFetchedAt(data.fetchedAt);
-      triggerRefresh();
-      setBalancesRefreshStatus("idle");
-    } catch (err) {
-      setBalancesRefreshStatus("error");
-      setBalancesRefreshError(
-        err instanceof Error ? err.message : "Failed to refresh account balances."
-      );
-    }
-  }, [triggerRefresh]);
 
   /* ---------- render ---------- */
 
@@ -889,7 +819,7 @@ export default function BudgetPage() {
                           <GlassDropdown
                             value={tfFrom}
                             onChange={setTfFrom}
-                            options={TRANSFER_FROM_DROPDOWN_OPTIONS}
+                            options={transferFromOptions}
                             placeholder="From…"
                             className="flex-1 min-w-0"
                             aria-label="Transfer from"
@@ -897,7 +827,7 @@ export default function BudgetPage() {
                           <GlassDropdown
                             value={tfTo}
                             onChange={setTfTo}
-                            options={TRANSFER_TO_DROPDOWN_OPTIONS}
+                            options={transferToOptions}
                             placeholder="To…"
                             className="flex-1 min-w-0"
                             aria-label="Transfer to"
@@ -1203,34 +1133,20 @@ export default function BudgetPage() {
             <div className="rounded-xl bg-[#252525] border border-charcoal-dark overflow-hidden flex flex-col">
               <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark flex items-center justify-between gap-3">
                 <h2 className="text-white font-semibold">Account Balances</h2>
-                <div className="flex items-center gap-2">
-                  {balancesFetchedAt && (
-                    <span className="text-xs text-gray-400 whitespace-nowrap">
-                      Updated {formatDateTimeMMDDYYHM(balancesFetchedAt)}
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={handleRefreshAccountBalances}
-                    disabled={balancesRefreshStatus === "refreshing"}
-                    className="p-1.5 rounded-md text-gray-400 hover:text-[#50C878] hover:bg-[#252525] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    aria-label="Refresh account balances"
-                    title="Refresh account balances"
-                  >
-                    {balancesRefreshStatus === "refreshing" ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <RefreshCw className="w-4 h-4" />
-                    )}
-                  </button>
-                </div>
+                <Link
+                  href="/net-worth"
+                  className="text-xs text-gray-400 hover:text-[#50C878] transition-colors whitespace-nowrap"
+                >
+                  Manage accounts
+                </Link>
               </div>
               <div className="p-3 flex-1 min-h-0 bg-[#252525]">
                 <div className="overflow-x-auto -mx-2">
-                  {balancesRefreshStatus === "error" && (
-                    <p className="text-red-400 text-xs px-2 pb-2">{balancesRefreshError}</p>
-                  )}
-                  {visibleAccountBalances.length === 0 ? (
+                  {accountNames.length === 0 ? (
+                    <p className="text-gray-400 text-sm px-2 py-2">
+                      No accounts yet. Add one on the Net Worth page to track balances.
+                    </p>
+                  ) : visibleAccountBalances.length === 0 ? (
                     <p className="text-gray-400 text-sm px-2 py-2">No accounts with a non-zero balance.</p>
                   ) : (
                     <table className="w-full text-sm">

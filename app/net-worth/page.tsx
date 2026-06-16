@@ -6,15 +6,9 @@ import MonthDropdown from "@/components/MonthDropdown";
 import { useMonth } from "@/contexts/MonthContext";
 import { useRefresh } from "@/contexts/RefreshContext";
 import { useExpensesData } from "@/contexts/ExpensesDataContext";
+import { useAccounts, type Account, type AccountType } from "@/contexts/AccountsContext";
 import { rowMatchesMonth } from "@/services/sheetsApi";
 import { getNetWorthSummary, type NetWorthSummary } from "@/services/netWorthService";
-import {
-  getSnaptradeHistory,
-  getSnaptradeInvestments,
-  getLatestSnaptradeBalances,
-  refreshSnaptradeBalances,
-  type RefreshSnaptradeBalancesResponse,
-} from "@/services/snaptradeApi";
 import {
   computeAccountBalances,
   getAccountAnchors,
@@ -68,7 +62,24 @@ type GrowthPoint = {
   month: string;
   label: string;
   sheetsNetChange: number | null;
-  fidelityValue: number | null;
+};
+
+const ACCOUNT_TYPE_OPTIONS: AccountType[] = [
+  "checking",
+  "savings",
+  "cash",
+  "credit",
+  "brokerage",
+  "other",
+];
+
+type AccountFormState = {
+  id?: string;
+  name: string;
+  type: AccountType;
+  openingBalance: string;
+  openingBalanceDate: string;
+  includeInReconcile: boolean;
 };
 
 const fmtCurrency = (n: number) =>
@@ -89,7 +100,7 @@ function parseMonthFromRow(row: { month?: string; timestamp?: string }): string 
 
   const numeric = Number(raw);
   if (Number.isFinite(numeric) && numeric >= 1 && numeric <= 12) {
-    return `2026-${String(numeric).padStart(2, "0")}`;
+    return `${new Date().getFullYear()}-${String(numeric).padStart(2, "0")}`;
   }
 
   const monthNames = [
@@ -110,7 +121,7 @@ function parseMonthFromRow(row: { month?: string; timestamp?: string }): string 
   for (let i = 0; i < monthNames.length; i += 1) {
     if (!raw.includes(monthNames[i])) continue;
     const parsedYear = Number(raw.replace(/[^0-9]/g, ""));
-    const year = Number.isFinite(parsedYear) && parsedYear > 1900 ? parsedYear : 2026;
+    const year = Number.isFinite(parsedYear) && parsedYear > 1900 ? parsedYear : new Date().getFullYear();
     return `${year}-${String(i + 1).padStart(2, "0")}`;
   }
 
@@ -132,16 +143,6 @@ function monthLabel(key: string): string {
   const [year, month] = key.split("-");
   const d = new Date(Number(year), Number(month) - 1, 1);
   return d.toLocaleDateString("en-US", { month: "short" });
-}
-
-function formatDateLabel(isoDate: string): string {
-  const d = new Date(isoDate);
-  if (Number.isNaN(d.getTime())) return "Unknown";
-  return d.toLocaleDateString("en-US", {
-    month: "short",
-    day: "numeric",
-    year: "2-digit",
-  });
 }
 
 function formatAcquiredDate(dateValue?: string | null): string {
@@ -183,6 +184,24 @@ async function fetchManualItems(url: string): Promise<ManualItem[]> {
     : [];
 }
 
+function isInvestingLabel(value: string): boolean {
+  const v = value.trim().toLowerCase();
+  if (!v) return false;
+  return [
+    "invest",
+    "brokerage",
+    "roth",
+    "ira",
+    "401k",
+    "hsa",
+    "crypto",
+    "stocks",
+    "fidelity",
+    "robinhood",
+    "schwab",
+  ].some((keyword) => v.includes(keyword));
+}
+
 export default function NetWorthPage() {
   const { selectedMonth } = useMonth();
   const { triggerRefresh } = useRefresh();
@@ -210,32 +229,39 @@ export default function NetWorthPage() {
   });
   const [savingRow, setSavingRow] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const [goalTarget, setGoalTarget] = useState<number>(100000);
-  const [historySource, setHistorySource] = useState<"experimental" | "snapshots" | "none">("none");
-  const [fidelityHistory, setFidelityHistory] = useState<Array<{ date: string; value: number }>>([]);
-  const [investments, setInvestments] = useState<{
-    brokerage: number;
-    rothIra: number;
-    fidelityTotal: number;
-    fetchedAt: string | null;
-  }>({
-    brokerage: 0,
-    rothIra: 0,
-    fidelityTotal: 0,
-    fetchedAt: null,
-  });
-  const [latestBrokerBalances, setLatestBrokerBalances] = useState<Partial<
-    Record<"Fidelity" | "Robinhood" | "Charles Schwab", number>
-  >>({});
+  const [goalTarget, setGoalTarget] = useState<number>(0);
   const [accountAnchors, setAccountAnchors] = useState<AccountAnchor[]>([]);
+
+  // Account management modal
+  const { accounts, refresh: refreshAccounts } = useAccounts();
+  const [accountModalOpen, setAccountModalOpen] = useState(false);
+  const [accountFormMode, setAccountFormMode] = useState<"create" | "edit">("create");
+  const [accountForm, setAccountForm] = useState<AccountFormState>({
+    name: "",
+    type: "checking",
+    openingBalance: "",
+    openingBalanceDate: "",
+    includeInReconcile: true,
+  });
+  const [accountSaving, setAccountSaving] = useState(false);
+  const [accountError, setAccountError] = useState<string | null>(null);
+  const [accountDeletingId, setAccountDeletingId] = useState<string | null>(null);
 
   const summaryReqRef = useRef(0);
   const tableReqRef = useRef(0);
-  const historyReqRef = useRef(0);
-  const investmentsReqRef = useRef(0);
-  const balancesReqRef = useRef(0);
   const anchorsReqRef = useRef(0);
+
+  const accountSeeds = useMemo(
+    () =>
+      accounts.map((a) => ({
+        name: a.name,
+        openingBalance: a.openingBalance,
+        openingBalanceDate: a.openingBalanceDate,
+      })),
+    [accounts]
+  );
 
   const filteredRows = useMemo(
     () => allRows.filter((row) => rowMatchesMonth(row, selectedMonth)),
@@ -277,21 +303,9 @@ export default function NetWorthPage() {
     return out;
   }, [allRows]);
 
-  const fidelityHistoryByMonth = useMemo<Record<string, number>>(() => {
-    const out: Record<string, number> = {};
-    const sorted = [...fidelityHistory].sort((a, b) => a.date.localeCompare(b.date));
-    for (const point of sorted) {
-      const d = new Date(point.date);
-      if (Number.isNaN(d.getTime())) continue;
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
-      out[key] = point.value;
-    }
-    return out;
-  }, [fidelityHistory]);
-
   const trendData = useMemo<GrowthPoint[]>(() => {
     const defaultKeys = lastSixMonthKeys();
-    const dynamicKeys = Object.keys({ ...sheetsHistoryByMonth, ...fidelityHistoryByMonth });
+    const dynamicKeys = Object.keys(sheetsHistoryByMonth);
     const keys = [...new Set([...defaultKeys, ...dynamicKeys])]
       .sort((a, b) => a.localeCompare(b))
       .slice(-12);
@@ -300,39 +314,12 @@ export default function NetWorthPage() {
       label: monthLabel(key),
       sheetsNetChange:
         sheetsHistoryByMonth[key] !== undefined ? Number(sheetsHistoryByMonth[key]) : null,
-      fidelityValue:
-        fidelityHistoryByMonth[key] !== undefined ? Number(fidelityHistoryByMonth[key]) : null,
     }));
-  }, [sheetsHistoryByMonth, fidelityHistoryByMonth]);
-
-  const fidelityLatestPoint = useMemo(() => {
-    const value = Number(latestBrokerBalances.Fidelity ?? 0);
-    if (!Number.isFinite(value) || value <= 0) return null;
-    const now = new Date();
-    const key = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-    return {
-      month: key,
-      label: monthLabel(key),
-      sheetsNetChange:
-        sheetsHistoryByMonth[key] !== undefined ? Number(sheetsHistoryByMonth[key]) : null,
-      fidelityValue: value,
-    } satisfies GrowthPoint;
-  }, [latestBrokerBalances.Fidelity, sheetsHistoryByMonth]);
-
-  const trendDataWithLatest = useMemo(() => {
-    if (!fidelityLatestPoint) return trendData;
-    const next = [...trendData];
-    const idx = next.findIndex((point) => point.month === fidelityLatestPoint.month);
-    if (idx >= 0) {
-      next[idx] = { ...next[idx], fidelityValue: fidelityLatestPoint.fidelityValue };
-      return next;
-    }
-    return [...next, fidelityLatestPoint].sort((a, b) => a.month.localeCompare(b.month));
-  }, [trendData, fidelityLatestPoint]);
+  }, [sheetsHistoryByMonth]);
 
   const accountBalances = useMemo(
-    () => computeAccountBalances(allRows, allTransfers, latestBrokerBalances, accountAnchors),
-    [allRows, allTransfers, latestBrokerBalances, accountAnchors]
+    () => computeAccountBalances(accountSeeds, allRows, allTransfers, accountAnchors),
+    [accountSeeds, allRows, allTransfers, accountAnchors]
   );
   const visibleAccountBalances = useMemo(
     () => Object.entries(accountBalances).filter(([, value]) => Math.abs(Number(value)) >= 0.005),
@@ -342,14 +329,24 @@ export default function NetWorthPage() {
     () => Object.values(accountBalances).reduce((sum, value) => sum + Number(value || 0), 0),
     [accountBalances]
   );
-  const latestBrokerBalancesTotal = useMemo(
-    () => Object.values(latestBrokerBalances).reduce((sum, value) => sum + Number(value || 0), 0),
-    [latestBrokerBalances]
-  );
+
+  // Investments = brokerage-type account balances + investing-labeled manual assets.
+  const investmentsTotal = useMemo(() => {
+    const brokerageNames = new Set(
+      accounts.filter((a) => a.type === "brokerage").map((a) => a.name)
+    );
+    const fromAccounts = Object.entries(accountBalances)
+      .filter(([name]) => brokerageNames.has(name))
+      .reduce((sum, [, value]) => sum + Number(value || 0), 0);
+    const fromAssets = assets
+      .filter((a) => isInvestingLabel(`${a.category} ${a.name}`))
+      .reduce((sum, a) => sum + Number(a.value || 0), 0);
+    return fromAccounts + fromAssets;
+  }, [accounts, accountBalances, assets]);
 
   const averageMonthlyExpenses = useMemo(() => {
-    if (trendDataWithLatest.length === 0) return 0;
-    const keys = new Set(trendDataWithLatest.map((point) => point.month));
+    if (trendData.length === 0) return 0;
+    const keys = new Set(trendData.map((point) => point.month));
     const expenseByMonth: Record<string, number> = {};
     allRows.forEach((row) => {
       if (row.expenseType.trim().toLowerCase() === "income") return;
@@ -357,17 +354,17 @@ export default function NetWorthPage() {
       if (!key || !keys.has(key)) return;
       expenseByMonth[key] = (expenseByMonth[key] ?? 0) + Number(row.amount || 0);
     });
-    const totals = trendDataWithLatest.map((point) => expenseByMonth[point.month] ?? 0);
+    const totals = trendData.map((point) => expenseByMonth[point.month] ?? 0);
     const sum = totals.reduce((acc, v) => acc + v, 0);
     return totals.length ? sum / totals.length : 0;
-  }, [allRows, trendDataWithLatest]);
+  }, [allRows, trendData]);
 
   const loadSummary = useCallback(async () => {
     const reqId = ++summaryReqRef.current;
     setSummaryLoading(true);
     setSummaryError(null);
     try {
-      const data = await getNetWorthSummary(selectedMonth);
+      const data = await getNetWorthSummary(selectedMonth, allAccountBalancesTotal);
       if (reqId !== summaryReqRef.current) return;
       setSummary(data);
     } catch (err) {
@@ -377,7 +374,7 @@ export default function NetWorthPage() {
       if (reqId !== summaryReqRef.current) return;
       setSummaryLoading(false);
     }
-  }, [selectedMonth]);
+  }, [selectedMonth, allAccountBalancesTotal]);
 
   const loadManualTables = useCallback(async () => {
     const reqId = ++tableReqRef.current;
@@ -397,75 +394,6 @@ export default function NetWorthPage() {
     } finally {
       if (reqId !== tableReqRef.current) return;
       setTableLoading(false);
-    }
-  }, []);
-
-  const loadFidelityHistory = useCallback(async () => {
-    const reqId = ++historyReqRef.current;
-    try {
-      const data = await getSnaptradeHistory();
-      if (reqId !== historyReqRef.current) return;
-      setFidelityHistory(data.points);
-      setHistorySource(data.source);
-    } catch (err) {
-      if (reqId !== historyReqRef.current) return;
-      console.error("Failed to load Fidelity history:", err);
-      setFidelityHistory([]);
-      setHistorySource("none");
-    }
-  }, []);
-
-  const loadInvestments = useCallback(async () => {
-    const reqId = ++investmentsReqRef.current;
-    try {
-      const data = await getSnaptradeInvestments();
-      if (reqId !== investmentsReqRef.current) return;
-      setInvestments(data);
-    } catch (err) {
-      if (reqId !== investmentsReqRef.current) return;
-      console.error("Failed to load investments:", err);
-      setInvestments({
-        brokerage: 0,
-        rothIra: 0,
-        fidelityTotal: 0,
-        fetchedAt: null,
-      });
-    }
-  }, []);
-
-  const loadLatestBrokerBalances = useCallback(async () => {
-    const reqId = ++balancesReqRef.current;
-    try {
-      const data: RefreshSnaptradeBalancesResponse = await getLatestSnaptradeBalances();
-      if (reqId !== balancesReqRef.current) return;
-      setLatestBrokerBalances(data.balances ?? {});
-      // Keep investments widget synchronized with latest pull even if historical rows were old schema.
-      if (
-        data.investments?.fidelityTotal > 0 ||
-        Number(data.balances?.Fidelity ?? 0) > 0
-      ) {
-        const total =
-          Number(data.investments?.fidelityTotal ?? 0) > 0
-            ? Number(data.investments.fidelityTotal)
-            : Number(data.balances?.Fidelity ?? 0);
-        const brokerage =
-          Number(data.investments?.brokerage ?? 0) + Number(data.investments?.rothIra ?? 0) > 0
-            ? Number(data.investments?.brokerage ?? 0)
-            : total;
-        const rothIra =
-          Number(data.investments?.brokerage ?? 0) + Number(data.investments?.rothIra ?? 0) > 0
-            ? Number(data.investments?.rothIra ?? 0)
-            : 0;
-        setInvestments((prev) => ({
-          brokerage,
-          rothIra,
-          fidelityTotal: total,
-          fetchedAt: data.fetchedAt ?? prev.fetchedAt,
-        }));
-      }
-    } catch (err) {
-      if (reqId !== balancesReqRef.current) return;
-      console.error("Failed to load latest broker balances:", err);
     }
   }, []);
 
@@ -496,51 +424,34 @@ export default function NetWorthPage() {
     setTableError(null);
     triggerRefresh();
     try {
-      await refreshSnaptradeBalances();
       await Promise.all([
         loadSummary(),
         loadManualTables(),
-        loadFidelityHistory(),
-        loadInvestments(),
-        loadLatestBrokerBalances(),
         loadAccountAnchors(),
+        refreshAccounts(),
       ]);
     } finally {
       setIsRefreshing(false);
     }
-  }, [triggerRefresh, loadSummary, loadManualTables, loadFidelityHistory, loadInvestments, loadLatestBrokerBalances, loadAccountAnchors]);
+  }, [triggerRefresh, loadSummary, loadManualTables, loadAccountAnchors, refreshAccounts]);
 
   useEffect(() => {
-    loadFidelityHistory();
-    loadInvestments();
-    loadLatestBrokerBalances();
     loadAccountAnchors();
-  }, [loadFidelityHistory, loadInvestments, loadLatestBrokerBalances, loadAccountAnchors]);
+  }, [loadAccountAnchors]);
 
-  const adjustedLiquidNetWorth = useMemo(() => {
-    if (!summary) return 0;
-    const delta = allAccountBalancesTotal - latestBrokerBalancesTotal;
-    return summary.liquidNetWorth + delta;
-  }, [summary, allAccountBalancesTotal, latestBrokerBalancesTotal]);
-
-  const adjustedTotalNetWorth = useMemo(() => {
-    if (!summary) return 0;
-    const delta = allAccountBalancesTotal - latestBrokerBalancesTotal;
-    return summary.totalNetWorth + delta;
-  }, [summary, allAccountBalancesTotal, latestBrokerBalancesTotal]);
+  const liquidNetWorth = summary?.liquidNetWorth ?? 0;
+  const totalNetWorth = summary?.totalNetWorth ?? 0;
 
   const liquidityRatio = useMemo(() => {
-    if (!summary) return 0;
-    const liabilitiesTotal = latestBrokerBalancesTotal - summary.liquidNetWorth;
-    const liquidAssets = adjustedLiquidNetWorth + liabilitiesTotal;
-    if (averageMonthlyExpenses <= 0) return 0;
-    return liquidAssets / averageMonthlyExpenses;
-  }, [summary, latestBrokerBalancesTotal, adjustedLiquidNetWorth, averageMonthlyExpenses]);
+    if (!summary || averageMonthlyExpenses <= 0) return 0;
+    // Liquid assets = account balances total (liquid net worth + liabilities).
+    return allAccountBalancesTotal / averageMonthlyExpenses;
+  }, [summary, allAccountBalancesTotal, averageMonthlyExpenses]);
 
   const runwayMonths = useMemo(() => {
     if (!summary || summary.spending <= 0) return 0;
-    return adjustedLiquidNetWorth / summary.spending;
-  }, [summary, adjustedLiquidNetWorth]);
+    return liquidNetWorth / summary.spending;
+  }, [summary, liquidNetWorth]);
 
   const savingsRate = useMemo(() => {
     if (!summary || summary.earning <= 0) return 0;
@@ -549,8 +460,8 @@ export default function NetWorthPage() {
 
   const goalProgress = useMemo(() => {
     if (!summary || goalTarget <= 0) return 0;
-    return Math.max(0, (adjustedTotalNetWorth / goalTarget) * 100);
-  }, [summary, adjustedTotalNetWorth, goalTarget]);
+    return Math.max(0, (totalNetWorth / goalTarget) * 100);
+  }, [summary, totalNetWorth, goalTarget]);
 
   const resetManualForm = useCallback((tab: "assets" | "liabilities") => {
     setManualForm({
@@ -638,8 +549,122 @@ export default function NetWorthPage() {
     }
   };
 
+  const deleteManualItem = async (item: ManualItem, tab: "assets" | "liabilities") => {
+    const label = tab === "assets" ? "asset" : "liability";
+    if (!window.confirm(`Delete ${label} "${item.name}"? This cannot be undone.`)) return;
+    const apiPath = tab === "assets" ? "/api/assets" : "/api/liabilities";
+    setDeletingId(item.id);
+    setTableError(null);
+    try {
+      const res = await fetch(apiPath, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: item.id }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || `Failed to delete ${label}`);
+      }
+      await Promise.all([loadManualTables(), loadSummary()]);
+    } catch (err) {
+      setTableError(err instanceof Error ? err.message : `Failed to delete ${label}`);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  /* ---------- account management ---------- */
+
+  const openCreateAccountModal = () => {
+    setAccountFormMode("create");
+    setAccountError(null);
+    setAccountForm({
+      name: "",
+      type: "checking",
+      openingBalance: "",
+      openingBalanceDate: "",
+      includeInReconcile: true,
+    });
+    setAccountModalOpen(true);
+  };
+
+  const openEditAccountModal = (account: Account) => {
+    setAccountFormMode("edit");
+    setAccountError(null);
+    setAccountForm({
+      id: account.id,
+      name: account.name,
+      type: account.type,
+      openingBalance: String(account.openingBalance ?? 0),
+      openingBalanceDate: account.openingBalanceDate ?? "",
+      includeInReconcile: account.includeInReconcile,
+    });
+    setAccountModalOpen(true);
+  };
+
+  const saveAccountForm = async () => {
+    const name = accountForm.name.trim();
+    const openingBalance = Number(accountForm.openingBalance || 0);
+    if (!name || !Number.isFinite(openingBalance)) {
+      setAccountError("Please provide a name and a numeric opening balance.");
+      return;
+    }
+    setAccountSaving(true);
+    setAccountError(null);
+    try {
+      const res = await fetch("/api/accounts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: accountForm.id,
+          name,
+          type: accountForm.type,
+          openingBalance,
+          openingBalanceDate: accountForm.openingBalanceDate.trim() || null,
+          includeInReconcile: accountForm.includeInReconcile,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || "Failed to save account");
+      }
+      setAccountModalOpen(false);
+      await Promise.all([refreshAccounts(), loadSummary()]);
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : "Failed to save account");
+    } finally {
+      setAccountSaving(false);
+    }
+  };
+
+  const deleteAccount = async (account: Account) => {
+    const purge = window.confirm(
+      `Delete account "${account.name}"?\n\nClick OK to also permanently remove its reconciliation history ` +
+        `(uploaded statements + balance anchor). Click Cancel to keep that history (it re-attaches if you ` +
+        `re-create an account with the same name).`
+    );
+    // Either choice proceeds with delete; purge just controls history removal.
+    setAccountDeletingId(account.id);
+    setAccountError(null);
+    try {
+      const res = await fetch("/api/accounts", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: account.id, purge }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || "Failed to delete account");
+      }
+      await Promise.all([refreshAccounts(), loadSummary()]);
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : "Failed to delete account");
+    } finally {
+      setAccountDeletingId(null);
+    }
+  };
+
   const activeRows = activeManualTab === "assets" ? assets : liabilities;
-  const activeCategories = activeManualTab === "assets" ? ASSET_CATEGORIES : LIABILITY_CATEGORIES;
   const isAssetForm = manualFormTab === "assets";
   const categoryLower = manualForm.category.trim().toLowerCase();
   const isVehicleAsset = isAssetForm && categoryLower === "vehicle";
@@ -677,13 +702,13 @@ export default function NetWorthPage() {
           <div className="rounded-xl bg-[#252525] border border-charcoal-dark p-4">
             <p className="text-sm text-gray-400">Total Net Worth</p>
             <p className="text-2xl font-semibold text-white mt-2">
-              {summaryLoading || !summary ? "Loading..." : fmtCurrency(adjustedTotalNetWorth)}
+              {summaryLoading || !summary ? "Loading..." : fmtCurrency(totalNetWorth)}
             </p>
           </div>
           <div className="rounded-xl bg-[#252525] border border-charcoal-dark p-4">
             <p className="text-sm text-gray-400">Liquid Net Worth</p>
             <p className="text-2xl font-semibold text-white mt-2">
-              {summaryLoading || !summary ? "Loading..." : fmtCurrency(adjustedLiquidNetWorth)}
+              {summaryLoading || !summary ? "Loading..." : fmtCurrency(liquidNetWorth)}
             </p>
           </div>
           <div className="rounded-xl bg-[#252525] border border-charcoal-dark p-4">
@@ -754,13 +779,23 @@ export default function NetWorthPage() {
                         <td className="py-2 pr-2">{formatAcquiredDate(row.acquisition_date)}</td>
                         <td className="py-2 pr-2 text-right">{fmtCurrency(Number(row.value || 0))}</td>
                         <td className="py-2 text-right">
-                          <button
-                            type="button"
-                            onClick={() => openEditModal(row, activeManualTab)}
-                            className="px-3 py-1 rounded-md bg-[#3a3a3a] text-gray-200 hover:bg-[#474747]"
-                          >
-                            Edit
-                          </button>
+                          <div className="inline-flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => openEditModal(row, activeManualTab)}
+                              className="px-3 py-1 rounded-md bg-[#3a3a3a] text-gray-200 hover:bg-[#474747]"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => deleteManualItem(row, activeManualTab)}
+                              disabled={deletingId === row.id}
+                              className="px-3 py-1 rounded-md bg-[#3a2a2a] text-red-300 hover:bg-[#4a3030] disabled:opacity-50"
+                            >
+                              {deletingId === row.id ? "Deleting..." : "Delete"}
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -813,14 +848,14 @@ export default function NetWorthPage() {
 
           <div className="rounded-xl bg-[#252525] border border-charcoal-dark overflow-hidden">
             <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark">
-              <h2 className="text-white font-semibold">Net Worth History (Sheets + Fidelity)</h2>
+              <h2 className="text-white font-semibold">Net Worth History (Monthly Net Change)</h2>
             </div>
             <div className="p-4 h-[320px]">
-              {trendDataWithLatest.length === 0 ? (
+              {trendData.length === 0 ? (
                 <p className="text-sm text-gray-400">No historical trend data available yet.</p>
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={trendDataWithLatest} margin={{ top: 6, right: 6, bottom: 6, left: 2 }}>
+                  <LineChart data={trendData} margin={{ top: 6, right: 6, bottom: 6, left: 2 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
                     <XAxis dataKey="label" stroke="#9ca3af" tick={{ fill: "#9ca3af", fontSize: 11 }} />
                     <YAxis
@@ -829,10 +864,7 @@ export default function NetWorthPage() {
                       tickFormatter={(v) => `$${Number(v).toLocaleString()}`}
                     />
                     <Tooltip
-                      formatter={(value: number, name: string) => [
-                        fmtCurrency(Number(value)),
-                        name === "sheetsNetChange" ? "Sheets Net Change" : "Fidelity Value",
-                      ]}
+                      formatter={(value: number) => [fmtCurrency(Number(value)), "Net Change"]}
                       contentStyle={{
                         backgroundColor: "#2F2F2F",
                         border: "1px solid #474747",
@@ -847,18 +879,11 @@ export default function NetWorthPage() {
                       strokeWidth={2.5}
                       connectNulls
                     />
-                    <Line
-                      type="monotone"
-                      dataKey="fidelityValue"
-                      stroke={PIE_COLORS[1 % PIE_COLORS.length]}
-                      strokeWidth={2.5}
-                      connectNulls
-                    />
                   </LineChart>
                 </ResponsiveContainer>
               )}
               <p className="text-xs text-gray-400 mt-2">
-                Fidelity history source: {historySource}
+                Income minus expenses per month (from your transaction sheet).
               </p>
             </div>
           </div>
@@ -877,19 +902,9 @@ export default function NetWorthPage() {
           </div>
           <div className="rounded-xl bg-[#252525] border border-charcoal-dark p-4">
             <p className="text-sm text-gray-400">Current Investments</p>
-            <div className="mt-2 space-y-1">
-              <p className="text-sm text-gray-300">
-                Brokerage: <span className="text-white font-semibold">{fmtCurrency(investments.brokerage)}</span>
-              </p>
-              <p className="text-sm text-gray-300">
-                Roth IRA: <span className="text-white font-semibold">{fmtCurrency(investments.rothIra)}</span>
-              </p>
-              <p className="text-sm text-gray-300">
-                Total: <span className="text-white font-semibold">{fmtCurrency(investments.fidelityTotal)}</span>
-              </p>
-            </div>
+            <p className="text-xl font-semibold text-white mt-2">{fmtCurrency(investmentsTotal)}</p>
             <p className="text-xs text-gray-500 mt-2">
-              Last pulled: {investments.fetchedAt ? formatDateLabel(investments.fetchedAt) : "Not yet refreshed"}
+              Brokerage-type accounts + investing-labeled assets.
             </p>
           </div>
           <div className="rounded-xl bg-[#252525] border border-charcoal-dark p-4">
@@ -913,9 +928,9 @@ export default function NetWorthPage() {
               <p className="text-sm text-gray-400">Goal Tracking</p>
               <input
                 type="number"
-                min={1}
+                min={0}
                 value={goalTarget}
-                onChange={(e) => setGoalTarget(Math.max(1, Number(e.target.value) || 1))}
+                onChange={(e) => setGoalTarget(Math.max(0, Number(e.target.value) || 0))}
                 className="w-28 rounded-md bg-[#1f1f1f] border border-charcoal-dark px-2 py-1 text-sm text-right text-white"
               />
             </div>
@@ -931,6 +946,193 @@ export default function NetWorthPage() {
             </p>
           </div>
         </div>
+
+        {/* ==================== Accounts management ==================== */}
+        <div className="rounded-xl bg-[#252525] border border-charcoal-dark overflow-hidden">
+          <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark flex items-center justify-between">
+            <h2 className="text-white font-semibold">Accounts</h2>
+            <button
+              type="button"
+              onClick={openCreateAccountModal}
+              className="px-2.5 py-1 rounded-md bg-[#252525] border border-charcoal-dark text-white hover:bg-[#2f2f2f]"
+              aria-label="Add account"
+              title="Add account"
+            >
+              + Add account
+            </button>
+          </div>
+          {accountError && (
+            <p className="px-4 pt-3 text-sm text-red-400">{accountError}</p>
+          )}
+          <div className="p-4 overflow-x-auto">
+            {accounts.length === 0 ? (
+              <p className="text-sm text-gray-400">
+                No accounts yet. Add your bank, cash, credit, and brokerage accounts to track
+                balances and reconcile statements.
+              </p>
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-gray-400 border-b border-charcoal-dark">
+                    <th className="py-2 pr-2">Name</th>
+                    <th className="py-2 pr-2">Type</th>
+                    <th className="py-2 pr-2 text-right">Opening Balance</th>
+                    <th className="py-2 pr-2">As Of</th>
+                    <th className="py-2 pr-2 text-center">Reconcile</th>
+                    <th className="py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="text-white">
+                  {accounts.map((account) => (
+                    <tr
+                      key={account.id}
+                      className="border-b border-charcoal-dark/80 odd:bg-[#2C2C2C]"
+                    >
+                      <td className="py-2 pr-2">{account.name}</td>
+                      <td className="py-2 pr-2 capitalize">{account.type}</td>
+                      <td className="py-2 pr-2 text-right">
+                        {fmtCurrency(Number(account.openingBalance || 0))}
+                      </td>
+                      <td className="py-2 pr-2">{formatAcquiredDate(account.openingBalanceDate)}</td>
+                      <td className="py-2 pr-2 text-center">
+                        {account.includeInReconcile ? "Yes" : "No"}
+                      </td>
+                      <td className="py-2 text-right">
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => openEditAccountModal(account)}
+                            className="px-3 py-1 rounded-md bg-[#3a3a3a] text-gray-200 hover:bg-[#474747]"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteAccount(account)}
+                            disabled={accountDeletingId === account.id}
+                            className="px-3 py-1 rounded-md bg-[#3a2a2a] text-red-300 hover:bg-[#4a3030] disabled:opacity-50"
+                          >
+                            {accountDeletingId === account.id ? "Deleting..." : "Delete"}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+
+        {accountModalOpen && (
+          <div
+            className="fixed inset-0 z-50 bg-black/50 p-4 flex items-center justify-center"
+            onClick={() => setAccountModalOpen(false)}
+          >
+            <div
+              className="w-full max-w-lg rounded-xl bg-[#252525] border border-charcoal-dark overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-4 py-3 bg-[#353535] border-b border-charcoal-dark flex items-center justify-between">
+                <h3 className="text-white font-semibold">
+                  {accountFormMode === "create" ? "Add Account" : "Edit Account"}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setAccountModalOpen(false)}
+                  className="px-2 py-1 rounded-md text-gray-300 hover:text-white hover:bg-[#2f2f2f]"
+                >
+                  Close
+                </button>
+              </div>
+              <div className="p-4 grid gap-3 md:grid-cols-2">
+                <label className="text-sm text-gray-300 md:col-span-2">
+                  Account Name
+                  <input
+                    value={accountForm.name}
+                    onChange={(e) => setAccountForm((prev) => ({ ...prev, name: e.target.value }))}
+                    className="mt-1 w-full rounded-md bg-[#1f1f1f] border border-charcoal-dark px-2 py-1 text-white"
+                    placeholder="Main Checking, Cash, Visa..."
+                  />
+                  <span className="mt-1 block text-xs text-gray-500">
+                    Use the same name you reconcile under to keep statement history attached.
+                  </span>
+                </label>
+                <label className="text-sm text-gray-300">
+                  Type
+                  <select
+                    value={accountForm.type}
+                    onChange={(e) =>
+                      setAccountForm((prev) => ({ ...prev, type: e.target.value as AccountType }))
+                    }
+                    className="mt-1 w-full rounded-md bg-[#1f1f1f] border border-charcoal-dark px-2 py-1 text-white capitalize"
+                  >
+                    {ACCOUNT_TYPE_OPTIONS.map((t) => (
+                      <option key={t} value={t} className="capitalize">
+                        {t}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-sm text-gray-300">
+                  Opening Balance
+                  <input
+                    value={accountForm.openingBalance}
+                    onChange={(e) =>
+                      setAccountForm((prev) => ({ ...prev, openingBalance: e.target.value }))
+                    }
+                    className="mt-1 w-full rounded-md bg-[#1f1f1f] border border-charcoal-dark px-2 py-1 text-white text-right"
+                    placeholder="0.00"
+                  />
+                </label>
+                <label className="text-sm text-gray-300">
+                  As-Of Date
+                  <input
+                    type="date"
+                    value={accountForm.openingBalanceDate}
+                    onChange={(e) =>
+                      setAccountForm((prev) => ({ ...prev, openingBalanceDate: e.target.value }))
+                    }
+                    className="mt-1 w-full rounded-md bg-[#1f1f1f] border border-charcoal-dark px-2 py-1 text-white"
+                  />
+                  <span className="mt-1 block text-xs text-gray-500">
+                    Only transactions after this date adjust the balance.
+                  </span>
+                </label>
+                <label className="text-sm text-gray-300 flex items-center gap-2 md:col-span-2">
+                  <input
+                    type="checkbox"
+                    checked={accountForm.includeInReconcile}
+                    onChange={(e) =>
+                      setAccountForm((prev) => ({ ...prev, includeInReconcile: e.target.checked }))
+                    }
+                  />
+                  Include in reconciliation (upload bank statements for this account)
+                </label>
+                {accountError && (
+                  <p className="md:col-span-2 text-sm text-red-400">{accountError}</p>
+                )}
+              </div>
+              <div className="px-4 py-3 border-t border-charcoal-dark flex justify-end gap-2 bg-[#252525]">
+                <button
+                  type="button"
+                  onClick={() => setAccountModalOpen(false)}
+                  className="px-3 py-1.5 rounded-md bg-[#3a3a3a] text-gray-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={saveAccountForm}
+                  disabled={accountSaving}
+                  className="px-3 py-1.5 rounded-md bg-[#50C878] text-black disabled:opacity-50"
+                >
+                  {accountSaving ? "Saving..." : "Save"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {manualModalOpen && (
           <div

@@ -198,11 +198,12 @@ export default function NewExpensePage() {
                     <span className="text-white">&ldquo;Amount&rdquo;</span>.
                   </li>
                   <li>
-                    Add another <span className="text-white">Ask for Input</span> → type{" "}
-                    <span className="text-white">Text</span>, prompt{" "}
-                    <span className="text-white">&ldquo;Category&rdquo;</span>. (Tip: to avoid typos, use{" "}
-                    <span className="text-white">Choose from Menu</span> instead and add one menu item per
-                    category from the list below.)
+                    To avoid typos, use a list instead of typing the category: add a{" "}
+                    <span className="text-white">List</span> action and add one list item for every category
+                    shown below (including <span className="text-white">&ldquo;Income&rdquo;</span>), spelled
+                    exactly as shown. Then add a <span className="text-white">Choose from List</span> action and
+                    set its list to the <span className="text-white">List</span> you just created — this is your
+                    Category input.
                   </li>
                   <li>
                     Add a third <span className="text-white">Ask for Input</span> → type{" "}

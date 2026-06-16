@@ -11,6 +11,40 @@ export type BankProfile = {
   creditIndex?: number | null;
 };
 
+/**
+ * User-defined CSV layout stored per-account in `accounts.csv_format`. A superset
+ * of BankProfile (adds header-row count, date-format hint, amount-sign convention).
+ * When `configured` is falsey the parser ignores it and behaves exactly as before.
+ */
+export type CsvFormat = {
+  version?: number;
+  headerRows?: number;
+  dateIndex: number | null;
+  amountIndex: number | null;
+  debitIndex?: number | null;
+  creditIndex?: number | null;
+  descriptionIndex: number | null;
+  dateFormat?: string;
+  amountSign?: "standard" | "flip";
+  configured?: boolean;
+};
+
+export type CsvParseOptions = {
+  profileOverride?: BankProfile;
+  startRowIndex?: number;
+  amountSign?: "standard" | "flip";
+};
+
+export function csvFormatToBankProfile(f: CsvFormat): BankProfile {
+  return {
+    dateIndex: f.dateIndex,
+    amountIndex: f.amountIndex,
+    descriptionIndex: f.descriptionIndex,
+    debitIndex: f.debitIndex ?? null,
+    creditIndex: f.creditIndex ?? null,
+  };
+}
+
 export const BANK_PROFILES: Record<string, BankProfile> = {
   "Wells Fargo": {
     dateIndex: 0,
@@ -498,6 +532,7 @@ export function mapBankRowToTransaction(
   accountName: keyof typeof BANK_PROFILES | string,
   row: string[],
   profileOverride?: BankProfile,
+  amountSign: "standard" | "flip" = "standard",
 ): BankTransaction | null {
   const profile = profileOverride ?? BANK_PROFILES[accountName];
   if (!profile || !isProfileConfigured(profile)) return null;
@@ -527,6 +562,7 @@ export function mapBankRowToTransaction(
     }
   }
   if (!date || !description || amount === null) return null;
+  if (amountSign === "flip") amount = -amount;
 
   return {
     accountName: String(accountName),
@@ -552,7 +588,23 @@ function disambiguateHashes(txs: BankTransaction[]): BankTransaction[] {
 export function mapBankRowsToTransactions(
   accountName: keyof typeof BANK_PROFILES | string,
   rows: string[][],
+  opts?: CsvParseOptions,
 ): BankTransaction[] {
+  // User-defined column mapping (override path). Bypasses the built-in bank-specific
+  // detection entirely; everything else (hash, description cleaning) is identical.
+  if (opts?.profileOverride) {
+    if (!isProfileConfigured(opts.profileOverride)) return [];
+    const start = opts.startRowIndex ?? 0;
+    return disambiguateHashes(
+      rows
+        .slice(start)
+        .map((row) =>
+          mapBankRowToTransaction(accountName, row, opts.profileOverride, opts.amountSign),
+        )
+        .filter((tx): tx is BankTransaction => tx !== null),
+    );
+  }
+
   const fallbackProfile = BANK_PROFILES[accountName];
   if (!fallbackProfile || !isProfileConfigured(fallbackProfile)) return [];
 
@@ -606,9 +658,10 @@ function fullRowKey(row: string[]): string {
 export function computeCsvIdentityKeys(
   accountName: string,
   rows: string[][],
+  opts?: CsvParseOptions,
 ): string[] {
-  const profileAccount = PROFILE_BY_ACCOUNT[accountName] ?? accountName;
-  const transactions = mapBankRowsToTransactions(profileAccount, rows);
+  const profileAccount = opts?.profileOverride ? accountName : (PROFILE_BY_ACCOUNT[accountName] ?? accountName);
+  const transactions = mapBankRowsToTransactions(profileAccount, rows, opts);
   const keyByRawRef = new Map<string[], string>();
   for (const tx of transactions) {
     if (tx.raw) keyByRawRef.set(tx.raw, `id:${tx.hash}`);
@@ -635,15 +688,81 @@ export function mergeCsvRowsByIdentity(
   accountName: string,
   existing: string[][],
   incoming: string[][],
+  opts?: CsvParseOptions,
 ): { rows: string[][]; keys: string[] } {
-  const existingKeys = computeCsvIdentityKeys(accountName, existing);
-  const incomingKeys = computeCsvIdentityKeys(accountName, incoming);
+  const existingKeys = computeCsvIdentityKeys(accountName, existing, opts);
+  const incomingKeys = computeCsvIdentityKeys(accountName, incoming, opts);
   const byKey = new Map<string, string[]>();
   existing.forEach((row, i) => byKey.set(existingKeys[i], row));
   incoming.forEach((row, i) => byKey.set(incomingKeys[i], row));
   return {
     rows: Array.from(byKey.values()),
     keys: Array.from(byKey.keys()),
+  };
+}
+
+function numOrNull(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * Reads a user-configured CSV layout for an account from Neon. Returns null when
+ * there is no row, no configured format, or the DB/env isn't ready — in which case
+ * callers fall back to the built-in BANK_PROFILES behaviour (hash-identical).
+ * Server-only (guards against client bundles like getProcessedTransactionHashes).
+ */
+export async function getAccountCsvFormat(accountName: string): Promise<CsvFormat | null> {
+  if (typeof window !== "undefined") return null;
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) return null;
+  try {
+    const { neon } = await import("@neondatabase/serverless");
+    const sql = neon(connectionString);
+    const rows = (await sql`
+      SELECT csv_format FROM accounts WHERE name = ${accountName} LIMIT 1
+    `) as { csv_format: unknown }[];
+    if (!rows.length) return null;
+    const fmt = rows[0].csv_format;
+    if (!fmt || typeof fmt !== "object" || Array.isArray(fmt)) return null;
+    const f = fmt as Record<string, unknown>;
+    if (!f.configured) return null;
+    return {
+      version: typeof f.version === "number" ? f.version : 1,
+      headerRows: typeof f.headerRows === "number" ? f.headerRows : 0,
+      dateIndex: numOrNull(f.dateIndex),
+      amountIndex: numOrNull(f.amountIndex),
+      debitIndex: numOrNull(f.debitIndex),
+      creditIndex: numOrNull(f.creditIndex),
+      descriptionIndex: numOrNull(f.descriptionIndex),
+      dateFormat: typeof f.dateFormat === "string" ? f.dateFormat : "auto",
+      amountSign: f.amountSign === "flip" ? "flip" : "standard",
+      configured: true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves the CsvParseOptions to feed the parser for an account, or undefined to
+ * use the built-in profile. Shared by the match, csv-rows, and dedupe routes so all
+ * three derive identical transaction identities (otherwise stored dedupe keys would
+ * diverge from matched hashes).
+ */
+export async function getCsvParseOptionsForAccount(
+  accountName: string,
+): Promise<CsvParseOptions | undefined> {
+  const fmt = await getAccountCsvFormat(accountName);
+  if (!fmt?.configured) return undefined;
+  return {
+    profileOverride: csvFormatToBankProfile(fmt),
+    startRowIndex: fmt.headerRows ?? 0,
+    amountSign: fmt.amountSign,
   };
 }
 

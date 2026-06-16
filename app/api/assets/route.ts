@@ -186,3 +186,33 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: message }, { status: 502 });
   }
 }
+
+export async function DELETE(request: NextRequest) {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    return NextResponse.json({ error: "DATABASE_URL not configured" }, { status: 503 });
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const id = typeof (body as { id?: unknown })?.id === "string" ? (body as { id: string }).id.trim() : "";
+  if (!id) {
+    return NextResponse.json({ error: "id is required" }, { status: 400 });
+  }
+
+  try {
+    const sql = neon(connectionString);
+    await ensureManualAssetsTable(sql);
+    await sql`DELETE FROM manual_assets WHERE id = ${id}`;
+    return NextResponse.json({ success: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("Assets DELETE error:", err);
+    return NextResponse.json({ error: message }, { status: 502 });
+  }
+}

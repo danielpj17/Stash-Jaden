@@ -15,27 +15,18 @@ import {
   type TransferRow,
 } from "@/services/sheetsApi";
 import { EXPENSE_TYPE_OPTIONS } from "@/lib/constants";
-import { getLatestSnaptradeBalances } from "@/services/snaptradeApi";
-import type { BankTransaction, MatchResult } from "@/services/reconciliationService";
+import type { BankTransaction, MatchResult, CsvFormat } from "@/services/reconciliationService";
 import { generateMerchantFingerprint } from "@/lib/merchantFingerprint";
 import {
   computeAccountBalances,
   getAccountAnchors,
-  mapAccountNameToBalanceKey,
 } from "@/services/accountBalancesService";
+import { useAccounts } from "@/contexts/AccountsContext";
+import CsvMappingModal from "@/components/CsvMappingModal";
 import { RECONCILIATION_RESET_CONFIRM } from "@/lib/reconciliationReset";
 
-type AccountOption =
-  | "WF Checking"
-  | "WF Savings"
-  | "Fidelity"
-  | "Venmo - Daniel"
-  | "Venmo - Katie"
-  | "Capital One"
-  | "Discover"
-  | "Schwab"
-  | "America First"
-  | "Ally";
+/** Account names are user-defined now; this is just a string. */
+type AccountOption = string;
 
 type MatchResponse = {
   bankTransactions: BankTransaction[];
@@ -159,33 +150,18 @@ type UserStatementClaimModalState = {
   error: string;
 };
 
-const ACCOUNT_OPTIONS: AccountOption[] = [
-  "WF Checking",
-  "WF Savings",
-  "Fidelity",
-  "Venmo - Daniel",
-  "Venmo - Katie",
-  "Capital One",
-  "Discover",
-  "Schwab",
-  "America First",
-  "Ally",
-];
 const ALL_ACCOUNTS_OPTION = "All";
+const RECONCILE_STORAGE_KEY = "reconcile-page-state-v3";
 
-const ACCOUNT_DROPDOWN_OPTIONS: GlassDropdownOption[] = [
-  { value: ALL_ACCOUNTS_OPTION, label: ALL_ACCOUNTS_OPTION },
-  ...ACCOUNT_OPTIONS.map((a) => ({ value: a, label: a })),
-];
-
-const CSV_PARSER_READY_ACCOUNTS = new Set<AccountOption>([
+// Built-in CSV parsers (BANK_PROFILES) that work without a saved csv_format. These
+// match the legacy hard-coded account names; new accounts configure their own mapping.
+const LEGACY_PARSER_READY_ACCOUNTS = new Set<string>([
   "WF Checking",
   "WF Savings",
   "Venmo - Daniel",
   "Venmo - Katie",
   "Capital One",
 ]);
-const RECONCILE_STORAGE_KEY = "reconcile-page-state-v3";
 
 function claimKey(sheetName: string, rowId: string): string {
   return `${sheetName}:${rowId}`;
@@ -343,9 +319,6 @@ function isProcessedWithoutNeonClaim(
   );
 }
 
-function accountHasConfiguredParser(account: string): boolean {
-  return CSV_PARSER_READY_ACCOUNTS.has(account as AccountOption);
-}
 
 function normalizeDateOnly(raw?: string): string {
   if (!raw) return "";
@@ -617,25 +590,61 @@ async function saveCsvRowsToNeon(accountName: string, rows: string[][]): Promise
 }
 
 export default function ReconcilePage() {
-  const [selectedAccount, setSelectedAccount] = useState<AccountOption>("WF Checking");
+  const { accounts, reconcileAccountNames, refresh: refreshAccounts } = useAccounts();
+  const ACCOUNT_OPTIONS = reconcileAccountNames;
+  const ACCOUNT_DROPDOWN_OPTIONS: GlassDropdownOption[] = useMemo(
+    () => [
+      { value: ALL_ACCOUNTS_OPTION, label: ALL_ACCOUNTS_OPTION },
+      ...reconcileAccountNames.map((a) => ({ value: a, label: a })),
+    ],
+    [reconcileAccountNames],
+  );
+  /** A CSV parser is "configured" for known built-in banks (legacy names) or any account with a saved csv_format. */
+  const accountHasConfiguredParser = useCallback(
+    (account: string): boolean => {
+      const acct = accounts.find((a) => a.name === account);
+      if (acct?.csvFormat && (acct.csvFormat as { configured?: boolean }).configured) return true;
+      return LEGACY_PARSER_READY_ACCOUNTS.has(account);
+    },
+    [accounts],
+  );
+  const accountSeeds = useMemo(
+    () =>
+      accounts.map((a) => ({
+        name: a.name,
+        openingBalance: a.openingBalance,
+        openingBalanceDate: a.openingBalanceDate,
+      })),
+    [accounts],
+  );
+
+  const [selectedAccount, setSelectedAccount] = useState<AccountOption>("");
   const [isUploading, setIsUploading] = useState(false);
   const [removingDuplicates, setRemovingDuplicates] = useState(false);
   const [rematching, setRematching] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const matchedSectionRef = useRef<HTMLElement | null>(null);
   const [matchesByAccount, setMatchesByAccount] = useState<Record<string, MatchResult[]>>({});
-  const [activeTab, setActiveTab] = useState<string>(ACCOUNT_OPTIONS[0]);
+  const [activeTab, setActiveTab] = useState<string>("");
   const [viewMode, setViewMode] = useState<ReconcileViewMode>("home");
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const accountParam = params.get("account");
-    if (accountParam && ACCOUNT_OPTIONS.includes(accountParam as AccountOption)) {
-      setSelectedAccount(accountParam as AccountOption);
+    if (accountParam && reconcileAccountNames.includes(accountParam)) {
+      setSelectedAccount(accountParam);
       setActiveTab(accountParam);
       setViewMode("accountDetail");
     }
-  }, []);
+  }, [reconcileAccountNames]);
+
+  // Default the selected account to the first reconcilable account once accounts load.
+  useEffect(() => {
+    if (!selectedAccount && reconcileAccountNames.length > 0) {
+      setSelectedAccount(reconcileAccountNames[0]);
+      setActiveTab((prev) => prev || reconcileAccountNames[0]);
+    }
+  }, [reconcileAccountNames, selectedAccount]);
   const [dismissalNotesById, setDismissalNotesById] = useState<Record<string, string>>({});
   const [userDismissedRowKeys, setUserDismissedRowKeys] = useState<Set<string>>(new Set());
   const [userDismissalNotesByEntryId, setUserDismissalNotesByEntryId] = useState<Record<string, string>>(
@@ -704,6 +713,13 @@ export default function ReconcilePage() {
     saving: false,
     error: "",
   });
+  const [csvMappingModal, setCsvMappingModal] = useState<{
+    open: boolean;
+    file: File | null;
+    rows: string[][];
+    saving: boolean;
+    error: string;
+  }>({ open: false, file: null, rows: [], saving: false, error: "" });
   const [dismissModal, setDismissModal] = useState<DismissModalState>({
     open: false,
     match: null,
@@ -2069,15 +2085,13 @@ export default function ReconcilePage() {
       error: "",
     });
     try {
-      const [rows, transfers, latestBroker, anchors] = await Promise.all([
+      const [rows, transfers, anchors] = await Promise.all([
         getExpenses(),
         getTransfers(),
-        getLatestSnaptradeBalances(),
         getAccountAnchors(),
       ]);
-      const balances = computeAccountBalances(rows, transfers, latestBroker.balances ?? {}, anchors);
-      const key = mapAccountNameToBalanceKey(selectedAccount);
-      const balance = balances[key];
+      const balances = computeAccountBalances(accountSeeds, rows, transfers, anchors);
+      const balance = balances[selectedAccount];
       if (!Number.isFinite(balance)) {
         throw new Error(`Could not determine current balance for ${selectedAccount}.`);
       }
@@ -2093,7 +2107,7 @@ export default function ReconcilePage() {
         error: err instanceof Error ? err.message : "Failed to load current balance.",
       }));
     }
-  }, [selectedAccount]);
+  }, [selectedAccount, accountSeeds]);
 
   const closeAnchorModal = useCallback(() => {
     setAnchorModal((prev) => ({
@@ -4024,20 +4038,13 @@ export default function ReconcilePage() {
     }
   }, [allMatches, closeTransferClaimModal, handleSplitSubmit, handleUserStatementClaimSubmit, rematchAllStoredAccounts, transferClaimModal]);
 
-  const onDrop = useCallback(
-    async (files: File[]) => {
-      const file = files[0];
-      if (!file) return;
+  const runUploadPipeline = useCallback(
+    async (file: File, parsedRows: string[][]) => {
       setUploadError("");
       setActionError("");
       setIsUploading(true);
 
       try {
-        const parsedRows = await parseCsvFile(file);
-        if (parsedRows.length === 0) {
-          throw new Error("CSV file has no data rows.");
-        }
-
         // Tag every audit-log entry from this upload with a single UUID so future
         // CSV-cascade-delete (Phase 3 follow-up) can group them.
         const csvUploadId =
@@ -4279,6 +4286,92 @@ export default function ReconcilePage() {
     [persistAutoClaim, selectedAccount],
   );
 
+  const onDrop = useCallback(
+    async (files: File[]) => {
+      const file = files[0];
+      if (!file) return;
+      setUploadError("");
+      if (!selectedAccount) {
+        setUploadError("Select an account before uploading a statement.");
+        return;
+      }
+      let parsedRows: string[][];
+      try {
+        parsedRows = await parseCsvFile(file);
+      } catch (err) {
+        setUploadError(err instanceof Error ? err.message : "Failed to parse CSV.");
+        return;
+      }
+      if (parsedRows.length === 0) {
+        setUploadError("CSV file has no data rows.");
+        return;
+      }
+      // First upload for an account with no saved/built-in parser: ask the user to
+      // map the columns before we touch storage. Avoids importing garbage rows.
+      if (!accountHasConfiguredParser(selectedAccount)) {
+        setCsvMappingModal({ open: true, file, rows: parsedRows, saving: false, error: "" });
+        return;
+      }
+      await runUploadPipeline(file, parsedRows);
+    },
+    [selectedAccount, accountHasConfiguredParser, runUploadPipeline],
+  );
+
+  const handleSaveCsvMapping = useCallback(
+    async (format: CsvFormat) => {
+      const account = accounts.find((a) => a.name === selectedAccount);
+      if (!account) {
+        setCsvMappingModal((prev) => ({ ...prev, error: "Account not found." }));
+        return;
+      }
+      setCsvMappingModal((prev) => ({ ...prev, saving: true, error: "" }));
+      try {
+        const res = await fetch("/api/accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: account.id,
+            name: account.name,
+            type: account.type,
+            openingBalance: account.openingBalance,
+            openingBalanceDate: account.openingBalanceDate,
+            includeInReconcile: account.includeInReconcile,
+            csvFormat: { ...format, configured: true },
+          }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: res.statusText }));
+          throw new Error(err.error || "Failed to save column mapping");
+        }
+        await refreshAccounts();
+        const pendingFile = csvMappingModal.file;
+        const pendingRows = csvMappingModal.rows;
+        setCsvMappingModal({ open: false, file: null, rows: [], saving: false, error: "" });
+        if (pendingFile && pendingRows.length > 0) {
+          await runUploadPipeline(pendingFile, pendingRows);
+        }
+      } catch (err) {
+        setCsvMappingModal((prev) => ({
+          ...prev,
+          saving: false,
+          error: err instanceof Error ? err.message : "Failed to save column mapping",
+        }));
+      }
+    },
+    [accounts, selectedAccount, refreshAccounts, runUploadPipeline, csvMappingModal],
+  );
+
+  const openCsvMappingModalManually = useCallback(() => {
+    const storedRows = statementCsvRowsByAccountRef.current[selectedAccount] ?? [];
+    if (storedRows.length === 0) {
+      setUploadError(
+        "Drop a CSV file first — then you can map its columns (or re-map them here once a file is uploaded).",
+      );
+      return;
+    }
+    setCsvMappingModal({ open: true, file: null, rows: storedRows, saving: false, error: "" });
+  }, [selectedAccount]);
+
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     multiple: false,
@@ -4402,9 +4495,20 @@ export default function ReconcilePage() {
               <p className="text-xs text-gray-500 mt-1">
                 Account profile: <span className="text-gray-300">{selectedAccount}</span>
               </p>
-              {!accountHasConfiguredParser(selectedAccount) && (
+              {accountHasConfiguredParser(selectedAccount) ? (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openCsvMappingModalManually();
+                  }}
+                  className="mt-2 text-xs text-gray-400 underline hover:text-accent"
+                >
+                  Re-configure CSV columns
+                </button>
+              ) : (
                 <p className="text-xs text-yellow-300/90 mt-1">
-                  CSV parser not configured yet for this account. Upload may return no transactions.
+                  No CSV column mapping yet — dropping a file will let you map its columns first.
                 </p>
               )}
               {isUploading && (
@@ -6304,6 +6408,19 @@ export default function ReconcilePage() {
           </div>
         </div>
       )}
+      <CsvMappingModal
+        open={csvMappingModal.open}
+        accountName={selectedAccount}
+        sampleRows={csvMappingModal.rows}
+        initialFormat={accounts.find((a) => a.name === selectedAccount)?.csvFormat as CsvFormat | undefined}
+        saving={csvMappingModal.saving}
+        error={csvMappingModal.error}
+        onSave={handleSaveCsvMapping}
+        onClose={() =>
+          setCsvMappingModal({ open: false, file: null, rows: [], saving: false, error: "" })
+        }
+      />
+
       {anchorModal.open && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"

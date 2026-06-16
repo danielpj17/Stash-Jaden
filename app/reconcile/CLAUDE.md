@@ -139,7 +139,7 @@ type BulkFilter = "all" | "high_confidence" | "suggested" | "transfers";
 
 ## Neon Database Schema
 
-Full schema is in `docs/neon-budget-setup.sql`. Run that file in the Neon SQL editor to create all tables.
+Full schema is in `docs/neon-setup.sql` (the single consolidated setup file). Run that file in the Neon SQL editor to create all tables.
 
 ```sql
 -- Hash-based deduplication. One row per bank transaction.
@@ -269,6 +269,25 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_csv
 ---
 
 ## Bank Profiles & CSV Parsing
+
+### Per-account CSV format override (blank-slate)
+
+Accounts are user-defined (`accounts` table). Beyond the hard-coded `BANK_PROFILES`, each account
+can store a `csv_format` (a superset of `BankProfile`: adds `headerRows`, `dateFormat`, `amountSign`,
+`configured`). On first upload for an account with no built-in/saved parser, `components/CsvMappingModal.tsx`
+auto-detects the layout and lets the user confirm/override it, then `POST /api/accounts` saves it to
+`accounts.csv_format`.
+
+The override is applied **server-side** at the parser seam:
+- `getCsvParseOptionsForAccount(accountName)` (in `reconciliationService.ts`) reads `accounts.csv_format`
+  and returns `CsvParseOptions { profileOverride, startRowIndex, amountSign }` (or `undefined`).
+- `mapBankRowsToTransactions(account, rows, opts)` takes the override path when `opts.profileOverride`
+  is set (bypassing the WF/Venmo/Capital One detection); otherwise behaves exactly as before.
+- **All three** routes that resolve a profile load the same options: `match`, `csv-rows` (merge), and
+  `dedupe` — otherwise stored dedupe keys would diverge from matched hashes.
+
+`findMatches` and the hash inputs are **never** changed. Built-in accounts with no saved format parse
+byte-identically to before, so existing claims/processed records stay valid.
 
 ### Supported Banks
 

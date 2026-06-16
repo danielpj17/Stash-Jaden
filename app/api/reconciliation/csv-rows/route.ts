@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { neon } from "@neondatabase/serverless";
-import { mergeCsvRowsByIdentity } from "@/services/reconciliationService";
+import {
+  mergeCsvRowsByIdentity,
+  getCsvParseOptionsForAccount,
+} from "@/services/reconciliationService";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -118,7 +121,8 @@ export async function POST(request: NextRequest) {
     // --- Merge mode: identity-merge incoming with stored rows, then replace. ---
     if (body.merge === true) {
       const existing = await readStoredRowsForAccount(sql, accountName);
-      const merged = mergeCsvRowsByIdentity(accountName, existing, incoming);
+      const csvOpts = await getCsvParseOptionsForAccount(accountName);
+      const merged = mergeCsvRowsByIdentity(accountName, existing, incoming, csvOpts);
 
       // Replace stored rows for the account. The DELETE rides with the first
       // insert chunk so an empty/failed write never wipes existing data silently.

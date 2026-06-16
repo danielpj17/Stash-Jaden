@@ -1,48 +1,4 @@
 import type { SheetRow, TransferRow } from "@/services/sheetsApi";
-import type { SupportedBroker } from "@/services/snaptradeApi";
-
-/** Sheet / form labels -> account keys. Non-account inflow sources are intentionally omitted. */
-export const TRANSFER_LABEL_TO_BALANCE_KEY: Record<string, string> = {
-  "WF Checking": "Wells Fargo Checking",
-  "WF Savings": "Wells Fargo Savings",
-  "Venmo - Daniel": "Venmo - Daniel",
-  "Venmo - Katie": "Venmo - Katie",
-  /** Legacy sheet rows before split */
-  Venmo: "Venmo - Daniel",
-  Fidelity: "Fidelity",
-  Robinhood: "Robinhood",
-  My529: "My529",
-  "Charles Schwab": "Charles Schwab",
-  Ally: "Ally",
-  "Capital One": "Capital One",
-  "America First": "America First",
-  Discover: "Discover",
-};
-
-/**
- * Opening balances calibrated to your existing budget-page balance model.
- * These are combined with transfer deltas and all-time WF checking cashflow.
- */
-export const BASE_ACCOUNT_BALANCES: Record<string, number> = {
-  "Wells Fargo Checking": 427.1,
-  "Wells Fargo Savings": 1061.13,
-  "Venmo - Daniel": 28.24,
-  "Venmo - Katie": 28.23,
-  Fidelity: 10597.43,
-  Robinhood: 711.39,
-  My529: 0,
-  "Charles Schwab": 0,
-  Ally: 0,
-  "Capital One": 0,
-  "America First": 0,
-  Discover: 0,
-};
-
-const LIVE_BROKER_ACCOUNT_KEYS: SupportedBroker[] = [
-  "Fidelity",
-  "Robinhood",
-  "Charles Schwab",
-];
 
 export type AccountAnchor = {
   accountName: string;
@@ -50,7 +6,14 @@ export type AccountAnchor = {
   asOfDate: string;
 };
 
-function toDateKey(value?: string): string {
+/** Minimal account shape needed to seed balances (from the accounts table). */
+export type AccountSeed = {
+  name: string;
+  openingBalance: number;
+  openingBalanceDate?: string | null;
+};
+
+function toDateKey(value?: string | null): string {
   if (!value) return "";
   const raw = String(value).trim();
   if (!raw) return "";
@@ -63,43 +26,28 @@ function toDateKey(value?: string): string {
   return `${y}-${m}-${d}`;
 }
 
-export function mapAccountNameToBalanceKey(raw: string): string {
-  const name = raw.trim();
-  if (!name) return name;
-  const lower = name.toLowerCase();
-
-  if (lower === "wf checking" || lower === "wells fargo" || lower === "wells fargo checking") {
-    return "Wells Fargo Checking";
-  }
-  if (lower === "wf savings" || lower === "wells fargo savings") {
-    return "Wells Fargo Savings";
-  }
-  if (lower === "venmo - daniel") return "Venmo - Daniel";
-  if (lower === "venmo - katie") return "Venmo - Katie";
-  if (lower === "venmo") return "Venmo - Daniel";
-  return name;
-}
-
-function shouldApplyByAnchor(
+/**
+ * A transaction/transfer only counts toward an account balance if it happened
+ * strictly after that account's effective gate date (DB anchor date, or the
+ * account's opening-balance date when no anchor exists). No gate = always apply.
+ */
+function shouldApply(
   accountKey: string,
   transactionDate: string,
-  anchorByAccount: Map<string, AccountAnchor>,
+  gateDateByAccount: Map<string, string>,
 ): boolean {
-  const anchor = anchorByAccount.get(accountKey);
-  if (!anchor) return true;
-  const txDate = toDateKey(transactionDate);
-  const anchorDate = toDateKey(anchor.asOfDate);
-  if (!anchorDate) return true;
-  if (!txDate) return false;
-  // Only include transactions strictly after the anchor date.
-  return txDate > anchorDate;
+  const gate = gateDateByAccount.get(accountKey);
+  if (!gate) return true;
+  if (!transactionDate) return false;
+  return transactionDate > gate;
 }
 
 function buildAnchorMap(anchors: AccountAnchor[]): Map<string, AccountAnchor> {
   const map = new Map<string, AccountAnchor>();
   for (const anchor of anchors) {
     if (!Number.isFinite(anchor.confirmedBalance)) continue;
-    const key = mapAccountNameToBalanceKey(anchor.accountName);
+    const key = String(anchor.accountName ?? "").trim();
+    if (!key) continue;
     map.set(key, {
       accountName: key,
       confirmedBalance: Number(anchor.confirmedBalance),
@@ -107,12 +55,6 @@ function buildAnchorMap(anchors: AccountAnchor[]): Map<string, AccountAnchor> {
     });
   }
   return map;
-}
-
-function accountKeyForSheetRow(row: SheetRow): string {
-  const fromSheet = mapAccountNameToBalanceKey(String(row.account ?? "").trim());
-  if (fromSheet) return fromSheet;
-  return "Wells Fargo Checking";
 }
 
 export async function getAccountAnchors(): Promise<AccountAnchor[]> {
@@ -132,40 +74,49 @@ export async function getAccountAnchors(): Promise<AccountAnchor[]> {
     .filter((row) => row.accountName.trim() !== "" && Number.isFinite(row.confirmedBalance));
 }
 
+/**
+ * Computes current balances for the user's accounts.
+ *
+ * Each account is seeded from its opening balance; a DB anchor (if present)
+ * overrides the seed and gate date. Transfers and sheet rows are then applied
+ * by canonical account name. Precedence per account: anchor > opening balance > 0.
+ */
 export function computeAccountBalances(
+  accounts: AccountSeed[],
   allRows: SheetRow[],
   allTransfers: TransferRow[],
-  liveBrokerBalances: Partial<Record<SupportedBroker, number>>,
   accountAnchors: AccountAnchor[] = [],
 ): Record<string, number> {
   const anchorByAccount = buildAnchorMap(accountAnchors);
-  const balances: Record<string, number> = { ...BASE_ACCOUNT_BALANCES };
-  for (const [accountKey, anchor] of anchorByAccount.entries()) {
-    balances[accountKey] = anchor.confirmedBalance;
+  const balances: Record<string, number> = {};
+  const gateDateByAccount = new Map<string, string>();
+
+  for (const acct of accounts) {
+    const name = String(acct.name ?? "").trim();
+    if (!name) continue;
+    balances[name] = Number(acct.openingBalance) || 0;
+    const openDate = toDateKey(acct.openingBalanceDate ?? "");
+    if (openDate) gateDateByAccount.set(name, openDate);
+  }
+
+  // DB anchors override the opening balance and gate date.
+  for (const [name, anchor] of anchorByAccount.entries()) {
+    balances[name] = anchor.confirmedBalance;
+    if (anchor.asOfDate) gateDateByAccount.set(name, anchor.asOfDate);
+    else gateDateByAccount.delete(name);
   }
 
   for (const t of allTransfers) {
     const amt = Number(t.amount);
     if (!Number.isFinite(amt) || amt === 0) continue;
     const txDate = toDateKey(t.timestamp);
-    const fromLabel = t.transferFrom.trim();
-    const toLabel = t.transferTo.trim();
-    const fromKey = mapAccountNameToBalanceKey(TRANSFER_LABEL_TO_BALANCE_KEY[fromLabel] ?? "");
-    const toKey = mapAccountNameToBalanceKey(TRANSFER_LABEL_TO_BALANCE_KEY[toLabel] ?? "");
+    const fromKey = t.transferFrom.trim();
+    const toKey = t.transferTo.trim();
 
-    if (
-      fromKey &&
-      balances[fromKey] !== undefined &&
-      shouldApplyByAnchor(fromKey, txDate, anchorByAccount)
-    ) {
+    if (fromKey && balances[fromKey] !== undefined && shouldApply(fromKey, txDate, gateDateByAccount)) {
       balances[fromKey] -= amt;
     }
-    if (
-      toLabel !== "Misc." &&
-      toKey &&
-      balances[toKey] !== undefined &&
-      shouldApplyByAnchor(toKey, txDate, anchorByAccount)
-    ) {
+    if (toKey && balances[toKey] !== undefined && shouldApply(toKey, txDate, gateDateByAccount)) {
       balances[toKey] += amt;
     }
   }
@@ -173,9 +124,9 @@ export function computeAccountBalances(
   for (const row of allRows) {
     const amount = Number(row.amount || 0);
     if (!Number.isFinite(amount) || amount === 0) continue;
-    const accountKey = accountKeyForSheetRow(row);
-    if (balances[accountKey] === undefined) continue;
-    if (!shouldApplyByAnchor(accountKey, toDateKey(row.timestamp), anchorByAccount)) continue;
+    const accountKey = String(row.account ?? "").trim();
+    if (!accountKey || balances[accountKey] === undefined) continue;
+    if (!shouldApply(accountKey, toDateKey(row.timestamp), gateDateByAccount)) continue;
 
     if (row.expenseType === "Income") {
       balances[accountKey] += amount;
@@ -184,12 +135,5 @@ export function computeAccountBalances(
     }
   }
 
-  const merged = { ...balances };
-  for (const key of LIVE_BROKER_ACCOUNT_KEYS) {
-    const liveValue = liveBrokerBalances[key];
-    if (typeof liveValue === "number" && Number.isFinite(liveValue)) {
-      merged[key] = liveValue;
-    }
-  }
-  return merged;
+  return balances;
 }
